@@ -4,6 +4,7 @@
 // action=review: accept or reject. Accept + link → create bidirectional link.
 //   Accept + orphan_rescue + archive → metabolize + update orphan status.
 //   Accept + orphan_rescue (rescue) → create link + update orphan status.
+//   Accept + dedup → create "duplicate" link + metabolize the newer observation.
 //   Accept + consolidation → create skill observation, metabolize sources, accept candidate.
 // action=stats: return proposal statistics
 
@@ -11,12 +12,20 @@ import { generateId, getTimestamp, toStringArray } from "../helpers";
 import { RESONANCE_TYPES } from "../constants";
 import type { DaemonProposalType, Link, Observation } from "../types";
 import type { ToolContext } from "./context";
+import { createParadoxLoop } from "./connections";
+
+// cross_agent's accept branch matches its own staged ConsolidationCandidate by
+// exact source_observation_ids set (see the branch below). Only cross-agent.ts
+// ever creates one, so this pool doesn't need to be as large as a corpus scan —
+// wide enough that a real backlog doesn't hide the match, no wider than that.
+const CONSOLIDATION_CANDIDATE_SCAN_LIMIT = 200;
 
 const PROPOSAL_TYPES: DaemonProposalType[] = [
 	"link",
 	"orphan_rescue",
 	"consolidation",
 	"dedup",
+	"salience_regrade",
 	"cross_agent",
 	"cross_tenant",
 	"paradox_detected",
@@ -35,7 +44,7 @@ const PROPOSAL_TYPES: DaemonProposalType[] = [
 export const TOOL_DEFS = [
 	{
 		name: "mind_propose",
-		description: "Review and manage daemon-generated proposals. action=list: see pending proposals (types: link, orphan_rescue, consolidation, dedup, cross_agent, cross_tenant, paradox_detected, skill_recapture, skill_supersession, skill_promotion, recall_contract, fact_commitment, project_routing_update, project_routing_drift, missing_artifact_receipt, stale_deploy_command, path_alias_conflict). action=review: accept or reject a proposal (link → bidirectional link; orphan_rescue → rescue or archive; consolidation → skill observation + metabolize sources). action=stats: acceptance statistics.",
+		description: "Review and manage daemon-generated proposals. action=list: see pending proposals (types: link, orphan_rescue, consolidation, dedup, salience_regrade, cross_agent, cross_tenant, paradox_detected, skill_recapture, skill_supersession, skill_promotion, recall_contract, fact_commitment, project_routing_update, project_routing_drift, missing_artifact_receipt, stale_deploy_command, path_alias_conflict). action=review: accept or reject a proposal (link → bidirectional link; orphan_rescue → rescue or archive; dedup → duplicate link + metabolize the newer side, never merged; consolidation → skill observation + metabolize sources; salience_regrade → demote foundational to active, unless still in shadow mode). action=stats: acceptance statistics.",
 		inputSchema: {
 			type: "object",
 			properties: {
@@ -138,6 +147,30 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				// Validate IDs contain only safe characters
 				if (!/^[a-zA-Z0-9_-]+$/.test(proposal.source_id) || !/^[a-zA-Z0-9_-]+$/.test(proposal.target_id)) {
 					return { error: "Invalid observation IDs in proposal" };
+				}
+
+				// ops/ADR-JANITOR.md §5.0, §5.5 (commit 7b) — this is now a DEAD-MAN'S
+				// SWITCH, not a mode gate. Before commit 7b, the daemon task itself
+				// created a real pending proposal for every candidate under shadow
+				// (tagged metadata.shadow: true) and this block was the ONLY thing
+				// stopping an accidental accept — the mode gate. Commit 7b moved the
+				// gate upstream: shadow mode now creates zero salience_regrade rows in
+				// the first place (daemon/tasks/salience-regrade.ts), so a proposal
+				// reaching this branch with metadata.shadow === true can only be one
+				// created by a pre-fix version of the daemon still sitting in the
+				// queue. Left byte-identical (:149-157) rather than removed — it costs
+				// nothing to keep and it is the only thing standing between an old
+				// shadow-tagged row and an accidental accept until that backlog is
+				// cleared. Rejection remains always allowed, shadow tag or not — safe
+				// and permanent by design (§5.5).
+				if (
+					proposal.proposal_type === "salience_regrade" &&
+					args.decision === "accepted" &&
+					(proposal.metadata as Record<string, unknown> | undefined)?.shadow === true
+				) {
+					return {
+						error: "salience_regrade proposal is in shadow mode — accept is disabled until an operator sets daemon_config.data.salience_regrade_shadow to false. Rejection is still allowed."
+					};
 				}
 
 				const reviewed = await storage.reviewProposal(
@@ -253,6 +286,258 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 							};
 						}
 					}
+
+					// --- dedup proposal: link the pair, metabolize the newer side ---
+					// ops/ADR-JANITOR.md §6.4 — dedup never merges. Nothing is deleted and
+					// both copies stay fully retrievable; the newer one just ranks lower
+					// from here on (scoring.ts's metabolized damping). resonance_type is
+					// fixed at "duplicate" — unlike the "link" branch above, there is no
+					// args.resonance_type override for this proposal type.
+					if (proposal.proposal_type === "dedup") {
+						const [sourceFound, targetFound] = await Promise.all([
+							storage.findObservation(proposal.source_id),
+							storage.findObservation(proposal.target_id)
+						]);
+
+						if (!sourceFound || !targetFound) {
+							return {
+								reviewed: true,
+								decision: "accepted",
+								proposal_id: reviewed.id,
+								action_taken: "observation_not_found"
+							};
+						}
+
+						const now = getTimestamp();
+						const fwdLink: Link = {
+							id: generateId("link"),
+							source_id: proposal.source_id,
+							target_id: proposal.target_id,
+							resonance_type: "duplicate",
+							strength: "present",
+							origin: "daemon",
+							created: now,
+							last_activated: now
+						};
+						const revLink: Link = {
+							id: generateId("link"),
+							source_id: proposal.target_id,
+							target_id: proposal.source_id,
+							resonance_type: "duplicate",
+							strength: "present",
+							origin: "daemon",
+							created: now,
+							last_activated: now
+						};
+
+						// "Newer" by created timestamp (ISO 8601 — lexicographic order is
+						// chronological order, same comparison kit-hygiene.ts already relies
+						// on for proposed_at). The older observation is treated as the
+						// canonical copy.
+						const newer = sourceFound.observation.created >= targetFound.observation.created
+							? sourceFound.observation
+							: targetFound.observation;
+						const texture = { ...newer.texture, charge_phase: "metabolized" as const };
+
+						await Promise.all([
+							storage.appendLink(fwdLink),
+							storage.appendLink(revLink),
+							storage.updateObservationTexture(newer.id, texture)
+						]);
+
+						return {
+							reviewed: true,
+							decision: "accepted",
+							proposal_id: reviewed.id,
+							action_taken: "linked_duplicate_and_metabolized_newer",
+							link_ids: [fwdLink.id, revLink.id],
+							metabolized_observation_id: newer.id
+						};
+					}
+
+					// --- salience_regrade proposal: demote foundational to active ---
+					// ops/ADR-JANITOR.md §5.2 — one step, never two ("foundational" ->
+					// "active"; never straight to "background"). The shadow-mode check
+					// above already returned before reviewProposal() ran if this branch
+					// would otherwise be a no-op, so reaching here means it's safe to apply.
+					if (proposal.proposal_type === "salience_regrade") {
+						const found = await storage.findObservation(proposal.source_id);
+						if (found) {
+							const texture = { ...found.observation.texture, salience: "active" };
+							await storage.updateObservationTexture(proposal.source_id, texture);
+						}
+
+						return {
+							reviewed: true,
+							decision: "accepted",
+							proposal_id: reviewed.id,
+							action_taken: found ? "demoted_to_active" : "observation_not_found",
+							observation_id: proposal.source_id
+						};
+					}
+
+					// --- paradox_detected proposal: create the burning paradox loop ---
+					// The proposal's stated purpose (paradox-detection.ts:5-6, "propose a
+					// paradox loop") — accept is the only place that purpose is realized.
+					// Never AI-reviewed (ai-review.ts's gatherCandidates never fetches this
+					// type) and never absorbed (no automatic accept path exists anywhere,
+					// same non-negotiable as salience_regrade/dedup above).
+					//
+					// source_id === target_id === the single identity core the detector
+					// found (paradox-detection.ts) — the detector structurally cannot name
+					// a counter-core, so linked_entity_ids here is deliberately ONE element,
+					// not the two mind_loop action=paradox normally requires. Do not invent
+					// a second core to satisfy that gate; createParadoxLoop (connections.ts)
+					// is the shared creation path with no such minimum. A tension whose
+					// other half isn't named yet is the thing worth sitting with.
+					if (proposal.proposal_type === "paradox_detected") {
+						const cores = await storage.readIdentityCores();
+						const core = cores.find(c => c.id === proposal.source_id);
+
+						if (!core) {
+							return {
+								reviewed: true,
+								decision: "accepted",
+								proposal_id: reviewed.id,
+								action_taken: "core_not_found"
+							};
+						}
+
+						const loop = await createParadoxLoop(storage, {
+							content: proposal.rationale ?? `Paradox: identity core "${core.name}" carries unresolved tension — counter-core not yet named.`,
+							linked_entity_ids: [core.id],
+							status: "burning"
+						});
+
+						return {
+							reviewed: true,
+							decision: "accepted",
+							proposal_id: reviewed.id,
+							action_taken: "created_paradox_loop",
+							loop_id: loop.id
+						};
+					}
+
+					// --- cross_agent proposal: realize the synthesis the daemon already staged ---
+					// cross-agent.ts (daemon/tasks/cross-agent.ts) creates BOTH a pending
+					// ConsolidationCandidate (suggested_type: "synthesis") and this proposal
+					// in the same loop iteration, from the same sourceObsIds — the candidate
+					// is the daemon's own draft of what accept should do; nothing here
+					// invents it. Same source_id === target_id shape as paradox_detected
+					// (both equal the converged entity, metadata.target_entity_id) — the
+					// real per-agent observation IDs live only in metadata.agents[].obs_id.
+					//
+					// Unlike "consolidation" above (kit-hygiene.ts: one agent's OWN history,
+					// archived into a fresh skill), the contributing observations here
+					// belong to DIFFERENT agents who each independently reached a related
+					// finding. Metabolizing them on accept would erase one agent's memory of
+					// their own finding merely because another agent noticed something
+					// similar — that is not what convergence means, so the sources are left
+					// exactly as live as they were. The new observation records the
+					// convergence itself; source_observations is its provenance
+					// (Observation.source_observations — documented for exactly this:
+					// "provenance for synthesis/consolidation observations").
+					//
+					// Never AI-reviewed (ai-review.ts's gatherCandidates never fetches this
+					// type) and never absorbed (absorption.ts has no branch for it).
+					if (proposal.proposal_type === "cross_agent") {
+						const meta = (proposal.metadata ?? {}) as Record<string, unknown>;
+						const agentsMeta = Array.isArray(meta.agents) ? (meta.agents as Array<Record<string, unknown>>) : [];
+						const obsIds = agentsMeta
+							.map(a => (typeof a.obs_id === "string" ? a.obs_id : undefined))
+							.filter((id): id is string => Boolean(id));
+
+						// The daemon task only ever proposes cross_agent with 2+ converging
+						// agents (cross-agent.ts:73: `if (agentsSeen.size < 2) continue`) — a
+						// proposal with fewer than 2 real obs IDs here means the metadata was
+						// hand-edited or corrupted, not a legitimate convergence.
+						if (obsIds.length < 2) {
+							return {
+								reviewed: true,
+								decision: "accepted",
+								proposal_id: reviewed.id,
+								action_taken: "invalid_metadata"
+							};
+						}
+
+						const targetEntityId = typeof meta.target_entity_id === "string" ? meta.target_entity_id : proposal.source_id;
+						const agentNames = agentsMeta
+							.map(a => (typeof a.agent_name === "string" ? a.agent_name : undefined))
+							.filter((n): n is string => Boolean(n));
+
+						// Close the loop on the daemon's own staged candidate, matched by
+						// exact source_observation_ids set — the only field both records
+						// share, since cross-agent.ts builds them from the same sourceObsIds
+						// in the same iteration. Not found is not an error: the candidate is
+						// a convenience cross-reference, not a dependency — nothing below
+						// requires it to exist.
+						const candidates = await storage.listConsolidationCandidates("pending", CONSOLIDATION_CANDIDATE_SCAN_LIMIT);
+						const obsIdSet = new Set(obsIds);
+						const matchedCandidate = candidates.find(c =>
+							c.source_observation_ids.length === obsIdSet.size &&
+							c.source_observation_ids.every(id => obsIdSet.has(id))
+						);
+						if (matchedCandidate) {
+							await storage.reviewConsolidationCandidate(matchedCandidate.id, "accepted");
+						}
+
+						const now = getTimestamp();
+						const synthesisObs: Observation = {
+							id: generateId("obs"),
+							content: matchedCandidate?.pattern_description
+								?? proposal.rationale
+								?? `${agentNames.join(", ")} independently converged on entity ${targetEntityId}`,
+							territory: "craft",
+							created: now,
+							texture: {
+								salience: "active",
+								vividness: "vivid",
+								charge: [],
+								grip: "present",
+								charge_phase: "fresh"
+							},
+							context: `Cross-agent synthesis from proposal ${proposal.id}`,
+							access_count: 0,
+							type: "synthesis",
+							entity_id: targetEntityId,
+							source_observations: obsIds
+						};
+
+						await storage.appendToTerritory("craft", synthesisObs);
+
+						return {
+							reviewed: true,
+							decision: "accepted",
+							proposal_id: reviewed.id,
+							action_taken: "created_synthesis_observation",
+							synthesis_observation_id: synthesisObs.id,
+							entity_id: targetEntityId,
+							contributing_observation_ids: obsIds,
+							candidate_id: matchedCandidate?.id
+						};
+					}
+
+					// --- cross_tenant proposal: deliberately NO accept branch ---
+					// cross-tenant.ts's source_id/target_id are two real observation IDs,
+					// one per tenant — structurally the same shape "link" and "dedup" use,
+					// and the honest accept action that shape implies is the same one they
+					// take: a bidirectional link. But making that link genuinely
+					// bidirectional (so BOTH tenants can surface the convergence, which is
+					// the entire point of "convergence") means writing the reverse link
+					// into the OTHER tenant's storage via forTenant() — a write into
+					// another tenant's data. ADR-JANITOR.md §8's "never automatic" list,
+					// item 5, names "any cross-tenant action" as the sovereignty boundary;
+					// a human-reviewed accept is not the same thing as an automatic one,
+					// but building the write anyway would still be inferring a
+					// cross-tenant-write design decision from the proposal's shape instead
+					// of getting one. Left unresolved on purpose — accept and reject both
+					// fall through to the generic tombstone below (action_taken: "none" on
+					// accept, same as before this commit). Whether the right call is a
+					// same-tenant-only action instead (e.g. a task, like
+					// recall_contract/fact_commitment below) or the cross-tenant write with
+					// Eli's sign-off is Falco's and Eli's call, not mine.
+					//
+					// Never AI-reviewed and never absorbed, same as cross_agent above.
 
 					// --- consolidation proposal: create skill obs, metabolize sources ---
 					if (proposal.proposal_type === "consolidation") {

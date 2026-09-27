@@ -8,6 +8,7 @@
 import type { CapturedSkillArtifact, DaemonProposal } from "../../types";
 import type { IBrainStorage } from "../../storage/interface";
 import type { DaemonTaskResult } from "../types";
+import { proposalKey } from "../../storage/keys";
 
 const MAX_SCAN_PER_STATUS = 200;
 const STALE_ACCEPTED_DAYS = 30;
@@ -106,7 +107,7 @@ export async function runSkillHealthTask(storage: IBrainStorage): Promise<Daemon
 	// Deduplicate within this run.
 	const deduped = new Map<string, SkillProposalAction>();
 	for (const action of actions) {
-		deduped.set(`${action.type}:${action.sourceId}:${action.targetId}`, action);
+		deduped.set(proposalKey(action.type, action.sourceId, action.targetId), action);
 	}
 	const uniqueActions = [...deduped.values()];
 
@@ -118,8 +119,7 @@ export async function runSkillHealthTask(storage: IBrainStorage): Promise<Daemon
 	const existing = await storage.batchProposalExists(checks);
 
 	for (const action of uniqueActions) {
-		const key = `${action.type}:${action.sourceId}:${action.targetId}`;
-		if (existing.has(key)) continue;
+		if (existing.has(proposalKey(action.type, action.sourceId, action.targetId))) continue;
 
 		await storage.createProposal({
 			tenant_id: storage.getTenant(),

@@ -1,5 +1,5 @@
 -- ============================================================
--- Brain v5 — Migration 016: Retrieval hint trigram index
+-- Brain v5 — Migration 018: Retrieval hint trigram index
 -- ============================================================
 
 -- Accelerates hint_text ILIKE search lane used by hybridSearch.

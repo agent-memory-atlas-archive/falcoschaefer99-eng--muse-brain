@@ -1,8 +1,8 @@
 // ============ WAKE TOOLS (v2) ============
 // mind_wake (depth: quick/full/orientation), mind_wake_log (action: log/read)
 
-import type { Observation, Letter, OpenLoop, BrainState, SubconsciousState, Task, WakeLogEntry, ProjectDossier, IdentityCore } from "../types";
-import { TERRITORIES } from "../constants";
+import type { Observation, Letter, OpenLoop, BrainState, SubconsciousState, Task, WakeLogEntry, ProjectDossier, IdentityCore, Anchor } from "../types";
+import { TERRITORIES, FOUNDATIONAL_LANE_CAP } from "../constants";
 import {
 	getTimestamp,
 	generateId,
@@ -15,6 +15,19 @@ import { getMoonPhaseData } from "../limbic/ephemeris";
 import type { MoonPhaseData } from "../limbic/ephemeris";
 import type { IBrainStorage } from "../storage/interface";
 import type { ToolContext } from "./context";
+import { DEFAULT_RETRIEVAL_PROFILE } from "../retrieval/query-signals";
+import type { DaemonRunTrace } from "../daemon/heartbeat";
+import type { RegradeSample, DedupSample, ParadoxSample, ScanRecord, NoveltyScanRecord, ValenceFloorResult } from "../daemon/types";
+import { LEASE_CAPABILITIES, hasCapability } from "../security/leases";
+import type { BrainLease } from "../security/leases";
+import {
+	DETECT_LIMIT_STEADY,
+	DETECT_LIMIT_BACKLOG,
+	RESCUE_LIMIT_STEADY,
+	RESCUE_LIMIT_BACKLOG,
+	SLOTS_PER_ORPHAN_STEADY,
+	SLOTS_PER_ORPHAN_BACKLOG
+} from "../daemon/tasks/orphans";
 
 export const TOOL_DEFS = [
 	{
@@ -170,7 +183,8 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 					storage,
 					await runQuickWake(storage, letters, loops, state, subconscious),
 					loops,
-					"full"
+					"full",
+					context.lease
 				);
 				if (limbicConfig?.enabled) {
 					results.wake.celestial = getMoonPhaseData(new Date());
@@ -307,7 +321,7 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				}
 			}
 
-			const quickResult = await finalizeWakePayload(storage, quickWake, loops, "quick");
+			const quickResult = await finalizeWakePayload(storage, quickWake, loops, "quick", context.lease);
 			if (limbicConfig?.enabled) {
 				quickResult.celestial = getMoonPhaseData(new Date());
 			}
@@ -320,14 +334,21 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 			if (action === "log") {
 				if (!args.summary) return { error: "summary is required for action=log" };
 
-				const wakeLog = {
+				const wakeLog: WakeLogEntry = {
 					id: generateId("wake"),
 					timestamp: getTimestamp(),
 					summary: args.summary,
 					actions: toStringArray(args.actions),
 					iron_pulls: toStringArray(args.iron_pulls),
 					mood: args.mood,
-					phase: getCurrentCircadianPhase().phase
+					phase: getCurrentCircadianPhase().phase,
+					// Distinguishes this hand-written row from finalizeWakePayload's "auto" rows,
+					// which also carry foundation_ids/anchor_ids — this path never touches the
+					// foundation lane, so it never fabricates those fields. Without this
+					// discriminator, a manual row written today is byte-for-byte the same shape
+					// as a pre-migration row from before foundation_ids/anchor_ids existed, and a
+					// forensic reader can no longer tell "old" from "manual" apart.
+					kind: "manual"
 				};
 
 				await storage.appendWakeLog(wakeLog);
@@ -534,11 +555,23 @@ async function finalizeWakePayload(
 	storage: IBrainStorage,
 	payload: any,
 	loops: OpenLoop[],
-	depth: "quick" | "full"
+	depth: "quick" | "full",
+	lease: BrainLease | undefined
 ): Promise<any> {
-	const delta = await buildWakeDelta(storage, loops);
+	const [delta, foundation, brainHealth] = await Promise.all([
+		buildWakeDelta(storage, loops),
+		buildFoundationLane(storage, payload, lease),
+		buildBrainHealth(storage)
+	]);
+
 	const finalized = {
 		...payload,
+		// Foundation lane deliberately does NOT participate in delta — it's the constant
+		// spine (anchors + foundational observations), not a "what changed" feed. Deltas
+		// track drift since the last wake; the whole point of this lane is the opposite:
+		// what never drifts, so it ships in full every single wake.
+		foundation,
+		brain_health: brainHealth,
 		delta
 	};
 
@@ -548,6 +581,16 @@ async function finalizeWakePayload(
 		summary: `auto ${depth} wake`,
 		actions: [],
 		iron_pulls: Array.isArray(finalized.pulling) ? finalized.pulling.map((item: any) => item.id).filter(Boolean) : [],
+		// `foundation` is the SAME object shipped in the payload above, already run through
+		// capFoundationLane's row + char-budget truncation — these ids are what actually
+		// rode along on this wake, not what buildFoundationLane considered before capping.
+		// anchor_ids is null (never []) when the lease lacked identity.read and anchors
+		// were never queried at all — anchors_omitted carries why. A wake that genuinely
+		// queried and found zero anchors still writes [], keeping "nothing to report" and
+		// "never looked" distinguishable on this log forever.
+		foundation_ids: foundation.foundational.map(o => o.id),
+		anchor_ids: foundation.anchors ? foundation.anchors.map(a => a.id) : null,
+		...(foundation.anchors_omitted ? { anchors_omitted: foundation.anchors_omitted } : {}),
 		phase: getCurrentCircadianPhase().phase,
 		kind: "auto",
 		depth,
@@ -786,4 +829,711 @@ function buildUnreadLetterPreview(unreadLetters: Letter[]): { from: string; prev
 		preview: oldest.content.slice(0, 100) + (oldest.content.length > 100 ? "..." : ""),
 		timestamp: oldest.timestamp
 	};
+}
+
+// ============ FOUNDATION LANE (ADR-SURFACER-POC §0) ============
+// The hand-gripped spine: anchors + foundational-salience observations, carried on
+// EVERY wake regardless of recency — so Rook never wakes up a stranger to what's
+// foundational, even on a quiet day with nothing recent to surface.
+
+const FOUNDATION_ANCHOR_CAP = 12;
+// Exported: ops/ADR-VALENCE-FLOOR.md's nightly seat-count simulation (daemon/
+// tasks/valence-floor.ts) needs this exact value to mirror stage 2's cut
+// (200 → 5) — one source of truth, not a second hardcoded "5" that could
+// silently drift from this one.
+export const FOUNDATION_OBS_CAP = 5;
+const FOUNDATION_SNIPPET_LEN = 240;
+const FOUNDATION_CHAR_CAP = 8000;
+
+type FoundationAnchor = {
+	id: string;
+	anchor_type: string;
+	content: string;
+	charge: string[];
+	triggers_memory_id?: string;
+	created: string;
+	activation_count: number;
+	last_activated: string;
+};
+
+type FoundationObservation = {
+	id: string;
+	territory: string;
+	essence: string;
+	snippet: string;
+	created: string;
+};
+
+type FoundationLane = {
+	anchors?: FoundationAnchor[];
+	anchors_omitted?: string;
+	foundational: FoundationObservation[];
+	foundational_total: number;
+	foundational_considered: number;
+};
+
+// mind_anchor requires identity.read — the foundation lane must hold itself to the
+// same bar. A lease scoped to memory.read alone (a valid, common delegation) must
+// never see anchor content ride along inside mind_wake's payload; that would be a
+// scope bypass. Absent lease (no header presented, e.g. daemon dispatch or a direct
+// tool call in tests) is treated as trusted-internal, matching how the rest of
+// ToolContext's optional fields (allowedTenants, tenantAliases) fall back to
+// compiled-in defaults when absent — the gate only bites once a lease is actually
+// on the table and it doesn't carry identity.read.
+function anchorsAllowedForLease(lease: BrainLease | undefined): boolean {
+	if (!lease) return true;
+	return hasCapability(lease, LEASE_CAPABILITIES.identityRead);
+}
+
+async function buildFoundationLane(storage: IBrainStorage, payload: any, lease: BrainLease | undefined): Promise<FoundationLane> {
+	const pullingIds = new Set<string>(
+		Array.isArray(payload?.pulling) ? payload.pulling.map((p: any) => p.id).filter(Boolean) : []
+	);
+	const recentGripIds = new Set<string>(
+		Array.isArray(payload?.recent_grip) ? payload.recent_grip.map((r: any) => r.id).filter(Boolean) : []
+	);
+
+	const anchorsAllowed = anchorsAllowedForLease(lease);
+
+	const [allAnchors, foundationalRows, foundationalTotal] = await Promise.all([
+		anchorsAllowed ? storage.readAnchors() : Promise.resolve([] as Anchor[]),
+		storage.readFoundationalObservations(),
+		typeof storage.countFoundationalObservations === "function"
+			? storage.countFoundationalObservations()
+			: Promise.resolve(undefined)
+	]);
+
+	let anchors: FoundationAnchor[] = [];
+	if (anchorsAllowed) {
+		anchors = selectAndTouchAnchors(allAnchors);
+		if (anchors.length > 0) {
+			try {
+				await storage.touchAnchors(anchors.map(a => a.id));
+			} catch (err) {
+				// Best-effort — the payload already carries the bumped count in memory; a
+				// failed persist just means next wake's count starts one behind, not a wake failure.
+				console.error("touchAnchors failed:", err instanceof Error ? err.message : "unknown error");
+			}
+		}
+	}
+
+	const foundationalConsidered = foundationalRows.length;
+	const foundationalTotalCount = typeof foundationalTotal === "number" ? foundationalTotal : foundationalConsidered;
+	if (foundationalTotalCount > foundationalConsidered) {
+		console.warn(`foundation lane: readFoundationalObservations truncated — considered ${foundationalConsidered} of ${foundationalTotalCount} total foundational observations`);
+	}
+
+	const foundational = foundationalRows
+		.filter(({ observation }) => !pullingIds.has(observation.id) && !recentGripIds.has(observation.id))
+		.map(({ observation, territory }) => ({ observation, territory, pull: calculatePullStrength(observation) }))
+		.sort((a, b) => b.pull - a.pull)
+		.slice(0, FOUNDATION_OBS_CAP)
+		.map(({ observation, territory }): FoundationObservation => ({
+			id: observation.id,
+			territory,
+			essence: extractEssence(observation),
+			snippet: observation.content.slice(0, FOUNDATION_SNIPPET_LEN) + (observation.content.length > FOUNDATION_SNIPPET_LEN ? "..." : ""),
+			created: observation.created
+		}));
+
+	const capped = capFoundationLane(anchors, foundational);
+
+	if (!anchorsAllowed) {
+		return {
+			anchors_omitted: "lease lacks identity.read",
+			foundational: capped.foundational,
+			foundational_total: foundationalTotalCount,
+			foundational_considered: foundationalConsidered
+		};
+	}
+
+	return {
+		anchors: capped.anchors,
+		foundational: capped.foundational,
+		foundational_total: foundationalTotalCount,
+		foundational_considered: foundationalConsidered
+	};
+}
+
+// Anchors are newest-first and capped at 12 — full content ships every wake since
+// anchors are short by design (a resonance point, not an essay). `activation_count`
+// reflects THIS wake's activation (mirrors mind_anchor action=check, which also
+// returns the post-increment count), so the caller can see "this just pulled."
+function selectAndTouchAnchors(allAnchors: Anchor[]): FoundationAnchor[] {
+	const sorted = [...allAnchors].sort((a, b) => (b.created || "") > (a.created || "") ? 1 : -1);
+	const now = getTimestamp();
+	return sorted.slice(0, FOUNDATION_ANCHOR_CAP).map(a => ({
+		id: a.id,
+		anchor_type: a.anchor_type,
+		content: a.content,
+		charge: a.charge || [],
+		triggers_memory_id: a.triggers_memory_id,
+		created: a.created,
+		activation_count: (a.activation_count || 0) + 1,
+		last_activated: now
+	}));
+}
+
+// Hard cap the lane at ~8,000 chars of content. Foundational snippets shrink (and
+// drop) first — anchors are the sturdier, shorter-by-design spine and are only
+// trimmed if anchor content alone already blows the budget.
+function capFoundationLane(anchors: FoundationAnchor[], foundational: FoundationObservation[]): { anchors: FoundationAnchor[]; foundational: FoundationObservation[] } {
+	const anchorChars = anchors.reduce((sum, a) => sum + a.content.length, 0);
+	let budget = FOUNDATION_CHAR_CAP - anchorChars;
+
+	const cappedFoundational: FoundationObservation[] = [];
+	for (const item of foundational) {
+		if (budget <= 0) break;
+		if (item.snippet.length <= budget) {
+			cappedFoundational.push(item);
+			budget -= item.snippet.length;
+		} else if (budget >= 3) {
+			// Only truncate-with-ellipsis when there's room for the "..." itself —
+			// otherwise slice(0, budget-3) clamps to 0 and the bare "..." (3 chars)
+			// would overshoot a budget of 1 or 2, blowing the hard cap it exists to enforce.
+			const truncated = item.snippet.slice(0, budget - 3) + "...";
+			cappedFoundational.push({ ...item, snippet: truncated });
+			budget = 0;
+		} else {
+			// Budget too small for even a truncated snippet — drop it, don't exceed the cap.
+			break;
+		}
+	}
+
+	// Foundational is fully drained and anchor content alone still exceeds the cap —
+	// only now start dropping anchors, oldest surfaced first (they're already newest-first).
+	let cappedAnchors = anchors;
+	if (cappedFoundational.length === 0 && anchorChars > FOUNDATION_CHAR_CAP) {
+		let running = 0;
+		cappedAnchors = [];
+		for (const a of anchors) {
+			if (running + a.content.length > FOUNDATION_CHAR_CAP) break;
+			running += a.content.length;
+			cappedAnchors.push(a);
+		}
+	}
+
+	return { anchors: cappedAnchors, foundational: cappedFoundational };
+}
+
+type BrainHealth = {
+	embedding_coverage_pct: number;
+	embedded: number;
+	total: number;
+	last_daemon: { finished_at: string | null; ok: boolean; completed_stages: number; failed_stages: string[] } | null;
+	retrieval_profile: typeof DEFAULT_RETRIEVAL_PROFILE;
+	janitor: JanitorHealth;
+	warning?: string;
+};
+
+// FOUNDATIONAL_LANE_CAP (imported from ../constants) is the foundation lane's
+// truncation threshold, shared with storage/postgres.ts and storage/sqlite.ts's
+// readFoundationalObservations, which rank by calculatePullStrength and slice to this
+// same number (ops/ADR-JANITOR.md §5.1 — until this commit it was a hard
+// `ORDER BY created_at DESC LIMIT 200` in SQL, truncating by recency ahead of this
+// file's own pull-strength ranking below; the two orderings disagreed and the SQL one
+// ran first, silently dropping high-pull-strength old memories before they were ever
+// considered). listOrphans/listProposals clamp their `limit` param to the same numeric
+// value, but that's a separate constant per call site, not this one.
+
+export type JanitorHealth = {
+	foundational: { count: number; cap: number; truncating: boolean };
+	iron: { count: number; pct_of_corpus: number };
+	charge_phase: { fresh: number; active: number; processing: number; metabolized: number };
+	orphans: { orphaned: number; oldest_days: number; drained_last_night: number; detected_last_night: number };
+	/**
+	 * ops/ADR-JANITOR.md §2.1 (Eli) — RESCUE_LIMIT is a `listOrphans` window size,
+	 * not drain capacity: under MAX_RESCUE_ATTEMPTS = A, one orphan's whole life
+	 * costs A + 1 window slots (once per attempt, once more to be recognised
+	 * `exhausted`), so the real invariant is
+	 * `detect_limit × slots_per_orphan < rescue_limit`, and net_per_night is
+	 * `detect_limit − floor(rescue_limit / slots_per_orphan)`. healthy is
+	 * `net_per_night < 0`, strictly.
+	 *
+	 * With the real, derived orphans.ts constants this is always healthy —
+	 * asserted at orphans.ts module load (`assertOrphanFlowInvariant`), so a
+	 * violation can only ever surface here via a broken derivation, never a live
+	 * one. The warning branch below stays wired (never suppressed by a flag) so a
+	 * future regression is visible at wake, not only in CI — the whole reason this
+	 * field is surfaced here at all rather than left in a comment and a ticket, per
+	 * §0.3's five-week `link_proposal_threshold` failure and §7's "legible at wake,
+	 * not via SQL" premise.
+	 */
+	orphan_flow: { detect_limit: number; rescue_limit: number; mode: "steady" | "backlog"; net_per_night: number; healthy: boolean };
+	proposals: { pending: number; oldest_pending_days: number | null; expired_last_night: number };
+	/**
+	 * shadow mirrors daemon_config.data.salience_regrade_shadow (ops/ADR-JANITOR.md
+	 * §5, §8) — absent reads as true (the safe default). Surfaced here so shadow
+	 * state is legible at wake, not only inferable from whether accepts succeed.
+	 *
+	 * candidates_last_scan/created_last_run/would_create_last_run/scan_at come
+	 * from the task's own ScanRecord (daemon_config.data.last_regrade_scan,
+	 * written by the same end-of-cycle heartbeat write as everything else here —
+	 * no new write). candidates_last_scan is null when no scan has ever run
+	 * (makes an unrun query self-reporting rather than indistinguishable from a
+	 * real zero, ops/ADR-JANITOR.md §7's null-vs-zero discipline).
+	 *
+	 * created_last_run mirrors ScanRecord.created — the run's ACTUAL insert
+	 * count, zero under shadow always. would_create_last_run mirrors
+	 * ScanRecord.would_create — the throughput cap's preview, computed
+	 * identically whether shadow suppressed the insert or not. These used to be
+	 * the same field (created_last_run reading would_create under the wrong
+	 * name) — ops/ADR-JANITOR.md §2.1 instance nine, commit 7c: a diagnostic
+	 * that reports what the cap would allow as if it were what happened, at
+	 * wake, in the exact instrument built to stop numbers lying at wake. Under
+	 * shadow the two read 0 and N; live they agree unless a deadline break cut
+	 * the create loop short (`last_run.truncated_by_deadline`).
+	 */
+	regrade: {
+		awaiting_rook: number;
+		accepted_total: number;
+		rejected_total: number;
+		shadow: boolean;
+		candidates_last_scan: number | null;
+		created_last_run: number;
+		would_create_last_run: number;
+		scan_at: string | null;
+	};
+	/**
+	 * ops/ADR-JANITOR.md §6.3 (commit 8) + this fix (surfacing the scan at wake,
+	 * flagged-not-built in commit 8's own note). Dedup's gate is a threshold
+	 * VALUE with no compiled default (§5.0's "constant nobody measured yet"),
+	 * not a boolean the way regrade's shadow is — `threshold: null` IS shadow
+	 * here; a caller that wants a `regrade.shadow`-shaped boolean can compute
+	 * `threshold === null` itself rather than this block carrying two fields
+	 * for one fact.
+	 *
+	 * candidates_last_scan/created_last_run/would_create_last_run/scan_at come
+	 * from the task's own ScanRecord (daemon_config.data.last_dedup_scan,
+	 * written by the same end-of-cycle heartbeat write as regrade's — no new
+	 * write), null/0 before the scan has ever run — same null-vs-zero
+	 * discipline as regrade.
+	 *
+	 * scanned_last_run mirrors ScanRecord.population_total: the number of
+	 * SOURCE observations this run's scan actually probed (protection-filtered,
+	 * capped at dedup.ts's SCAN_SOURCE_LIMIT=50, recency-ordered — the newest
+	 * slice of the corpus, not a sweep of all of it: ops/ADR-JANITOR.md §6.3
+	 * flags there is no rotation cursor yet). Read this against the sibling
+	 * `total` field on BrainHealth (the corpus's full row count) BEFORE
+	 * configuring a threshold — a low scanned_last_run relative to total means
+	 * most of the corpus has never been examined for duplicates, tonight or any
+	 * night, and enabling dedup does not change that.
+	 */
+	dedup: {
+		threshold: number | null;
+		candidates_last_scan: number | null;
+		created_last_run: number;
+		would_create_last_run: number;
+		scan_at: string | null;
+		scanned_last_run: number | null;
+	};
+	/**
+	 * Eli's audit generalisation of instance nine: `changes: 0, proposals: 0` is
+	 * indistinguishable from health for this task; `population_last_scan: 41,
+	 * candidates_last_scan: 0` is not. No shadow/threshold gate exists here
+	 * (unlike regrade/dedup) — created_last_run and would_create_last_run always
+	 * agree for this task, both mirrored so this block's shape stays consistent
+	 * with its siblings. Read from daemon_config.data.last_paradox_scan, written
+	 * by the same end-of-cycle heartbeat write as regrade/dedup above — no new
+	 * write. null (not 0) before the scan has ever run — same null-vs-zero
+	 * discipline as regrade/dedup.
+	 */
+	paradox: {
+		population_last_scan: number | null;
+		candidates_last_scan: number | null;
+		created_last_run: number;
+		would_create_last_run: number;
+		scan_at: string | null;
+	};
+	/**
+	 * fix(brain): novelty regeneration skips every memory that was never surfaced
+	 * — B4. Same shape/convention as `paradox` above (no shadow/threshold gate,
+	 * created_last_run and would_create_last_run always agree), plus
+	 * `never_surfaced_last_scan` — a field with no equivalent in regrade/dedup/
+	 * paradox, ops/ADR-JANITOR.md §2.1's "instance sixteen" for the novelty
+	 * stage. Read from daemon_config.data.last_novelty_scan, written by the same
+	 * end-of-cycle heartbeat write as regrade/dedup/paradox above — no new
+	 * write. null (not 0) before the scan has ever run — same null-vs-zero
+	 * discipline as its siblings.
+	 */
+	novelty: {
+		population_last_scan: number | null;
+		candidates_last_scan: number | null;
+		never_surfaced_last_scan: number | null;
+		created_last_run: number;
+		would_create_last_run: number;
+		scan_at: string | null;
+	};
+	backlog_mode: boolean;
+	last_run: { truncated_by_deadline: boolean };
+	/**
+	 * ops/ADR-VALENCE-FLOOR.md, slice 0 — measurement only, `seats` is NOT
+	 * consumed anywhere yet (buildFoundationLane below is untouched). Read
+	 * from daemon_config.data.valence_floor, written by the same end-of-cycle
+	 * heartbeat write as regrade/dedup/paradox/novelty above — no new write.
+	 * Absent entirely (never run) synthesizes the ADR's literal "before the
+	 * first janitor run" default here — `reason: "awaiting first
+	 * measurement"`, every count null (not 0) — same null-vs-zero discipline
+	 * as every sibling scan field. Once the task has run at least once, every
+	 * field is a real count; `reason` is then only present when the task's
+	 * OWN formula computed a genuine zero (different string, see
+	 * daemon/tasks/valence-floor.ts).
+	 */
+	valence_floor: {
+		seats: number;
+		reason?: string;
+		classified: number | null;
+		eligible: number | null;
+		eligible_share: number | null;
+		simulated_eligible_in_lane: number | null;
+		eligible_supply_after_cut: number | null;
+		lexicon_rows: number | null;
+		lexicon_coverage_pct: number | null;
+		unclassified_charge_count: number | null;
+		computed_at: string | null;
+	};
+	/**
+	 * ops/ADR-VALENCE-FLOOR.md, slice 3 — the write-time poke ("what did that
+	 * cost you — what did it give you?"). Stubbed here in slice 0 so the shape
+	 * exists before the mechanism does: every field null, reason names the
+	 * honest state. Not built until slice 3; this block does not change.
+	 */
+	valence_nudge: {
+		fired_total: number | null;
+		answered_total: number | null;
+		answer_rate: number | null;
+		current_cooldown_minutes: number | null;
+		last_fired_at: string | null;
+		reason: string;
+	};
+	/** Set only when orphan_flow.healthy is false — worded so a reader knows what it means without opening the ADR. */
+	warning?: string;
+};
+
+/**
+ * ops/ADR-JANITOR.md §2.1 — pure computation, extracted so tests can construct
+ * the unhealthy branch directly (arbitrary inputs). See the `orphan_flow` field
+ * doc on `JanitorHealth` above for why that branch is unreachable in production.
+ */
+export function computeOrphanFlow(
+	detectLimit: number,
+	rescueLimit: number,
+	slotsPerOrphan: number,
+	mode: "steady" | "backlog"
+): JanitorHealth["orphan_flow"] {
+	const netPerNight = detectLimit - Math.floor(rescueLimit / slotsPerOrphan);
+	return {
+		detect_limit: detectLimit,
+		rescue_limit: rescueLimit,
+		mode,
+		net_per_night: netPerNight,
+		healthy: netPerNight < 0
+	};
+}
+
+/**
+ * ops/ADR-JANITOR.md §7 — the nightly repair daemon's own health, legible at wake
+ * instead of a raw SQL console dig. Every method added in this commit is called
+ * defensively (`typeof storage.X === "function"`), same convention as
+ * countFoundationalObservations above: a backend/mock that predates these
+ * primitives reports zero rather than throwing, so this ships without retrofitting
+ * every hand-rolled test storage mock in the repo. Exported so tools-v2/health.ts
+ * can mirror the exact same numbers into mind_health without a second
+ * implementation drifting from this one.
+ */
+export async function buildJanitorHealth(storage: IBrainStorage): Promise<JanitorHealth> {
+	const [
+		coverage,
+		daemonConfig,
+		foundationalCount,
+		ironCount,
+		chargePhaseCounts,
+		orphanStats,
+		proposalStats,
+		oldestPendingDays
+	] = await Promise.all([
+		storage.getEmbeddingCoverage(),
+		storage.readDaemonConfig(),
+		typeof storage.countFoundationalObservations === "function"
+			? storage.countFoundationalObservations()
+			: Promise.resolve(0),
+		typeof storage.countIronObservations === "function"
+			? storage.countIronObservations()
+			: Promise.resolve(0),
+		typeof storage.getChargePhaseCounts === "function"
+			? storage.getChargePhaseCounts()
+			: Promise.resolve({ fresh: 0, active: 0, processing: 0, metabolized: 0 }),
+		typeof storage.getOrphanStats === "function"
+			? storage.getOrphanStats()
+			: Promise.resolve({ orphaned: 0, rescued: 0, archived: 0, oldest_days: 0 }),
+		typeof storage.getProposalStats === "function"
+			? storage.getProposalStats()
+			: Promise.resolve({} as Record<string, { total: number; accepted: number; rejected: number; ratio: number }>),
+		typeof storage.getOldestPendingProposalDays === "function"
+			? storage.getOldestPendingProposalDays()
+			: Promise.resolve(null)
+	]);
+
+	const totalCorpus = coverage.total;
+	const data = (daemonConfig.data ?? {}) as Record<string, unknown>;
+
+	// pending = total - accepted - rejected: daemon_proposals.status is always one of
+	// the three, so this needs no dedicated storage query (getProposalStats already
+	// groups by type).
+	const pendingAcrossTypes = Object.values(proposalStats).reduce(
+		(sum, s) => sum + Math.max(0, s.total - s.accepted - s.rejected),
+		0
+	);
+
+	// salience_regrade doesn't exist as a proposal_type until ops/ADR-JANITOR.md §9
+	// commit 7 — until then this key is simply absent from proposalStats and every
+	// regrade field below correctly reads zero.
+	const regradeStats = proposalStats["salience_regrade"];
+
+	const lastOrphanDrain = data.last_orphan_drain as { count?: number } | undefined;
+	// ops/ADR-JANITOR.md §2.1 "instance sixteen" (C2/C3) — same end-of-cycle
+	// heartbeat write as last_orphan_drain above, published beside it so
+	// detection and drain read together, not detection-invisible.
+	const lastOrphanDetect = data.last_orphan_detect as { count?: number } | undefined;
+	const lastExpiry = data.last_expiry as { deleted?: number } | undefined;
+	const lastDaemonRun = data.last_daemon_run as { truncated_by_deadline?: boolean } | undefined;
+	// ops/ADR-JANITOR.md §5 commit 7b — written by the same end-of-cycle heartbeat
+	// write as last_orphan_drain above, never a query of its own.
+	const lastRegradeScan = data.last_regrade_scan as ScanRecord<RegradeSample> | undefined;
+	// ops/ADR-JANITOR.md §6.3 commit 8 — same end-of-cycle heartbeat write as
+	// last_regrade_scan above, never a query of its own.
+	const lastDedupScan = data.last_dedup_scan as ScanRecord<DedupSample> | undefined;
+	// Same end-of-cycle heartbeat write as last_regrade_scan/last_dedup_scan
+	// above, never a query of its own — paradox-detection's own scan record.
+	const lastParadoxScan = data.last_paradox_scan as ScanRecord<ParadoxSample> | undefined;
+	// fix(brain): novelty regeneration skips every memory that was never
+	// surfaced — B4. Same end-of-cycle heartbeat write as the three scans
+	// above, never a query of its own — cycle.ts's inline "novelty" stage's
+	// own scan record.
+	const lastNoveltyScan = data.last_novelty_scan as NoveltyScanRecord | undefined;
+	// ops/ADR-VALENCE-FLOOR.md, slice 0 — same end-of-cycle heartbeat write as
+	// the four scans above, never a query of its own.
+	const valenceFloorData = data.valence_floor as ValenceFloorResult | undefined;
+	// ops/ADR-JANITOR.md §6.3/§5.0 — dedup's own shadow IS the absence of this
+	// value (no compiled default, unlike salience_regrade_shadow's boolean +
+	// default-true convention); null here means shadow, mirrored verbatim from
+	// daemon/tasks/dedup.ts's own read of the same key.
+	const dedupThreshold = typeof data.dedup_similarity_threshold === "number"
+		? data.dedup_similarity_threshold
+		: null;
+
+	// Same backlog_mode read as below, computed once and reused for both fields —
+	// orphan_flow's `mode` and the sibling `backlog_mode` field must never be able
+	// to disagree with each other.
+	const backlogMode = data.backlog_mode === true;
+	const mode: "steady" | "backlog" = backlogMode ? "backlog" : "steady";
+	const detectLimit = backlogMode ? DETECT_LIMIT_BACKLOG : DETECT_LIMIT_STEADY;
+	const rescueLimit = backlogMode ? RESCUE_LIMIT_BACKLOG : RESCUE_LIMIT_STEADY;
+	const slotsPerOrphan = backlogMode ? SLOTS_PER_ORPHAN_BACKLOG : SLOTS_PER_ORPHAN_STEADY;
+	const orphanFlow = computeOrphanFlow(detectLimit, rescueLimit, slotsPerOrphan, mode);
+	// This branch is unreachable with the real, derived orphans.ts constants
+	// (assertOrphanFlowInvariant throws at module load first) — left wired rather
+	// than deleted, per ops/ADR-JANITOR.md §2.1: the warning goes silent only by
+	// becoming unreachable through a correct derivation, never by a suppress flag.
+	const warning = orphanFlow.healthy
+		? undefined
+		: `${orphanFlow.mode}-mode orphan detection (${orphanFlow.detect_limit}/night) exceeds rescue capacity (${orphanFlow.rescue_limit}/night) — the backlog grows${orphanFlow.mode === "steady" ? " when backlog_mode is off" : ""}`;
+
+	return {
+		foundational: {
+			count: foundationalCount ?? 0,
+			cap: FOUNDATIONAL_LANE_CAP,
+			truncating: (foundationalCount ?? 0) > FOUNDATIONAL_LANE_CAP
+		},
+		iron: {
+			count: ironCount ?? 0,
+			pct_of_corpus: totalCorpus > 0 ? Math.round(((ironCount ?? 0) / totalCorpus) * 100) : 0
+		},
+		charge_phase: chargePhaseCounts ?? { fresh: 0, active: 0, processing: 0, metabolized: 0 },
+		orphans: {
+			orphaned: orphanStats.orphaned,
+			oldest_days: orphanStats.oldest_days,
+			drained_last_night: lastOrphanDrain?.count ?? 0,
+			detected_last_night: lastOrphanDetect?.count ?? 0
+		},
+		orphan_flow: orphanFlow,
+		proposals: {
+			pending: pendingAcrossTypes,
+			oldest_pending_days: oldestPendingDays,
+			expired_last_night: lastExpiry?.deleted ?? 0
+		},
+		regrade: {
+			awaiting_rook: regradeStats ? Math.max(0, regradeStats.total - regradeStats.accepted - regradeStats.rejected) : 0,
+			accepted_total: regradeStats?.accepted ?? 0,
+			rejected_total: regradeStats?.rejected ?? 0,
+			// ops/ADR-JANITOR.md §5, §8 — same absent-is-true convention as the
+			// daemon task's own read (daemon/tasks/salience-regrade.ts), computed
+			// independently here rather than threaded through so this stays a pure
+			// function of daemonConfig, matching backlog_mode's sibling field above.
+			shadow: data.salience_regrade_shadow !== false,
+			candidates_last_scan: lastRegradeScan?.candidates_total ?? null,
+			// ops/ADR-JANITOR.md §2.1 instance nine (commit 7c) — created_last_run
+			// used to mirror would_create (the cap's preview) under a name that
+			// means actual inserts. A pre-fix persisted scan (no `created` field)
+			// correctly falls back to 0 here, not to the old buggy value.
+			created_last_run: lastRegradeScan?.created ?? 0,
+			would_create_last_run: lastRegradeScan?.would_create ?? 0,
+			scan_at: lastRegradeScan?.at ?? null
+		},
+		dedup: {
+			threshold: dedupThreshold,
+			candidates_last_scan: lastDedupScan?.candidates_total ?? null,
+			created_last_run: lastDedupScan?.created ?? 0,
+			would_create_last_run: lastDedupScan?.would_create ?? 0,
+			scan_at: lastDedupScan?.at ?? null,
+			scanned_last_run: lastDedupScan?.population_total ?? null
+		},
+		paradox: {
+			population_last_scan: lastParadoxScan?.population_total ?? null,
+			candidates_last_scan: lastParadoxScan?.candidates_total ?? null,
+			created_last_run: lastParadoxScan?.created ?? 0,
+			would_create_last_run: lastParadoxScan?.would_create ?? 0,
+			scan_at: lastParadoxScan?.at ?? null
+		},
+		novelty: {
+			population_last_scan: lastNoveltyScan?.population_total ?? null,
+			candidates_last_scan: lastNoveltyScan?.candidates_total ?? null,
+			never_surfaced_last_scan: lastNoveltyScan?.never_surfaced_total ?? null,
+			created_last_run: lastNoveltyScan?.created ?? 0,
+			would_create_last_run: lastNoveltyScan?.would_create ?? 0,
+			scan_at: lastNoveltyScan?.at ?? null
+		},
+		// backlog_mode is operator-set, not daemon-written: ops/ADR-JANITOR.md §10's
+		// reversal row is a manual daemon_config.data.backlog_mode write ("free, no
+		// deploy"), and §9 commit 4 only READS it to gate orphan/absorption caps —
+		// no commit ever specifies the daemon writing this flag itself. Reads false
+		// honestly until an operator sets it (no backlog logic exists yet to be "in"
+		// or "out" of).
+		backlog_mode: backlogMode,
+		last_run: { truncated_by_deadline: lastDaemonRun?.truncated_by_deadline === true },
+		valence_floor: valenceFloorData ?? {
+			seats: 0,
+			reason: "awaiting first measurement",
+			classified: null,
+			eligible: null,
+			eligible_share: null,
+			simulated_eligible_in_lane: null,
+			eligible_supply_after_cut: null,
+			lexicon_rows: null,
+			lexicon_coverage_pct: null,
+			unclassified_charge_count: null,
+			computed_at: null
+		},
+		// ops/ADR-VALENCE-FLOOR.md, slice 3 — not built yet. Every field null,
+		// reason names the honest state, same convention as the "before the
+		// first janitor run" valence_floor default above.
+		valence_nudge: {
+			fired_total: null,
+			answered_total: null,
+			answer_rate: null,
+			current_cooldown_minutes: null,
+			last_fired_at: null,
+			reason: "not yet implemented"
+		},
+		...(warning ? { warning } : {})
+	};
+}
+
+// Rook's "tell me whether my recall is lying to me today" — surfaced on every wake,
+// never deltas (health is a snapshot, not a change feed). Reuses the same storage
+// reads mind_health section=embeddings/proposals already use — no new SQL.
+async function buildBrainHealth(storage: IBrainStorage): Promise<BrainHealth> {
+	const [coverage, daemonConfig, janitor] = await Promise.all([
+		storage.getEmbeddingCoverage(),
+		storage.readDaemonConfig(),
+		buildJanitorHealth(storage)
+	]);
+
+	const embeddingCoveragePct = coverage.total > 0
+		? Math.round((coverage.embedded / coverage.total) * 100)
+		: 100;
+
+	const rawTrace = (daemonConfig.data as Record<string, unknown> | undefined)?.last_daemon_run as DaemonRunTrace | undefined | null;
+	const failedStages = rawTrace && Array.isArray(rawTrace.failed_stages) ? rawTrace.failed_stages : [];
+	const lastDaemon = rawTrace
+		? {
+			finished_at: rawTrace.finished_at ?? null,
+			// A killed (Cloudflare budget) run never gets to call finish()/fail(), so it
+			// stays finished_at: null forever — see daemon/heartbeat.ts. A thrown fatal
+			// error stamps finished_at AND an `error` field. A caught per-stage error
+			// (stageFailed) also stamps finished_at AND error, but lets the cycle run
+			// to completion — completed_stages ("reached") is not "succeeded", so
+			// failed_stages is what actually distinguishes a clean run. Any of the three
+			// means "not ok."
+			ok: !!rawTrace.finished_at && !rawTrace.error && failedStages.length === 0,
+			completed_stages: Array.isArray(rawTrace.completed_stages) ? rawTrace.completed_stages.length : 0,
+			failed_stages: failedStages
+		}
+		: null;
+
+	const brainHealth: BrainHealth = {
+		embedding_coverage_pct: embeddingCoveragePct,
+		embedded: coverage.embedded,
+		total: coverage.total,
+		last_daemon: lastDaemon,
+		retrieval_profile: DEFAULT_RETRIEVAL_PROFILE,
+		janitor
+	};
+
+	const problems: string[] = [];
+	if (coverage.total > 0 && embeddingCoveragePct < 90) problems.push(`embedding coverage is ${embeddingCoveragePct}%`);
+	if (!lastDaemon) problems.push("no nightly daemon run has ever completed");
+	else if (!lastDaemon.ok) problems.push("the last nightly daemon run did not finish cleanly");
+
+	// ops/ADR-JANITOR.md §7's wake-time alarms.
+	if (janitor.foundational.truncating) {
+		problems.push(`the Foundation lane is showing you ${janitor.foundational.cap} of ${janitor.foundational.count} foundational memories`);
+	}
+	if (janitor.orphans.orphaned > 200) {
+		problems.push(`${janitor.orphans.orphaned} observations are orphaned, past the 200-row rescue clamp`);
+	}
+	if ((janitor.proposals.oldest_pending_days ?? 0) > 21) {
+		problems.push(`the oldest pending proposal has waited ${janitor.proposals.oldest_pending_days} days, approaching the 30-day auto-expiry`);
+	}
+	if (janitor.last_run.truncated_by_deadline) {
+		problems.push("last night's daemon run hit its time budget and stopped early");
+	}
+	// ops/ADR-JANITOR.md §5 commit 7b — unreachable by construction after this fix
+	// (shadow now creates zero proposals, so awaiting_rook can never be nonzero
+	// while shadow is still on), left wired anyway: this is the exact alarm that
+	// would have caught the commit-7 bug on night 1, and §2.1's discipline is that
+	// a warning goes silent only by becoming unreachable through a correct fix,
+	// never by being deleted or suppressed.
+	if (janitor.regrade.shadow === true && janitor.regrade.awaiting_rook > 0) {
+		problems.push(`${janitor.regrade.awaiting_rook} salience_regrade proposals exist while shadow is on — they can only be rejected, never accepted. This should be impossible.`);
+	}
+	// REMOVED (ops/ADR-JANITOR.md §5.1, this commit) — this alarm compared the
+	// salience_regrade candidate pool against a "close the gap to foundational.count −
+	// 200" target. That target was the category error §5's "Current state" box now
+	// documents: §5's fused (i) mechanical truncation and (ii) human judgment into one
+	// number, and made (i)'s fix wait on (ii)'s multi-week pace. The Foundation lane no
+	// longer needs foundational.count to shrink to ≤200 to behave correctly —
+	// readFoundationalObservations() (storage/postgres.ts, storage/sqlite.ts) now ranks
+	// by calculatePullStrength before truncating, so the ≤200 memories the lane
+	// considers are already the most-alive ones regardless of total corpus size.
+	// salience_regrade continues independently, judged on its own merits (§5.6) at its
+	// own pace (§5.3's WIP cap), never to satisfy this SQL limit. This was true and
+	// firing on essentially every scan (§7's old table) — it goes silent by removal,
+	// not by becoming unreachable, because the comparison itself was never a real
+	// invariant to preserve as a canary (contrast the shadow/awaiting_rook check just
+	// above, which stays wired because it tests a guarantee that should hold forever).
+	// `janitor.foundational.truncating` (below, unchanged) is the number that actually
+	// matters here: it still fires, honestly, whenever the corpus has more than 200
+	// foundational rows — that's expected to stay true for weeks while §5's demotion
+	// proceeds, and is no longer conflated with a target this check couldn't reach.
+	// Reuses janitor.warning verbatim rather than recomputing the orphan_flow
+	// condition here — single source of truth, same discipline as buildJanitorHealth
+	// being the one place §7's numbers are computed at all.
+	if (janitor.warning) problems.push(janitor.warning);
+
+	if (problems.length > 0) {
+		brainHealth.warning = `Recall may be degraded: ${problems.join(" and ")}.`;
+	}
+
+	return brainHealth;
 }

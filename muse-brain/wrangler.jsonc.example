@@ -15,7 +15,17 @@
   "compatibility_date": "2025-09-27",
   "compatibility_flags": ["global_fetch_strictly_public", "nodejs_compat"],
   "observability": { "enabled": true },
-  "triggers": { "crons": ["0 3 * * *"] },
+  // Nightly metabolism (decay/novelty) needs to run SOMEWHERE, once a night, per
+  // tenant. Pick ONE — running both fires the cycle twice every night:
+  //   (a) box runner (recommended) — `daemon-runner/main.ts` via a systemd timer
+  //       (see ops/rook-brain-daemon.service + rook-brain-daemon.timer, or your
+  //       platform's cron equivalent). The Worker's own `scheduled()` handler is a
+  //       no-op by design so it's safe to leave the trigger below commented out.
+  //   (b) Worker cron — uncomment the line below. Only viable on Workers PAID
+  //       ($5/mo+): the FREE plan caps CPU at 10ms/invocation and rejects a
+  //       "limits": { "cpu_ms": ... } override (error 100328), so the daemon cycle
+  //       reliably dies mid-run with error 1102 (exceededResources) on free.
+  // "triggers": { "crons": ["0 3 * * *"] },
   "ai": { "binding": "AI" },
   "hyperdrive": [
     {

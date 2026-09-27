@@ -98,15 +98,15 @@ Add a structured `workspace_routing` block to project dossier metadata.
     "canonical_repo_url": "git@github.com:.../dupin-service.git",
     "default_branch": "main",
     "local_paths": [
-      "/Users/falco/AI/rainer-workspace/dupin-service"
+      "~/AI/rainer-workspace/dupin-service"
     ],
     "artifact_roots": [
-      "/Users/falco/AI/rainer-workspace/generated-assets"
+      "~/AI/rainer-workspace/generated-assets"
     ],
     "deploy": {
       "kind": "cloudflare_worker",
       "commands": [
-        "npx wrangler deploy -c /Users/falco/AI/rainer-workspace/dupin-service/wrangler.toml"
+        "npx wrangler deploy -c ~/AI/rainer-workspace/dupin-service/wrangler.toml"
       ],
       "preview_urls": [],
       "production_urls": [
@@ -122,7 +122,7 @@ Add a structured `workspace_routing` block to project dossier metadata.
       "inspector service"
     ],
     "handoff_docs": [
-      "/Users/falco/AI/rainer-workspace/handovers/2026-05-11-dupin-decouple.md"
+      "~/AI/rainer-workspace/handovers/2026-05-11-dupin-decouple.md"
     ],
     "related_projects": [
       "dupin-site"
@@ -220,9 +220,9 @@ The runtime / retrieval layer should be able to produce:
 {
   "project": "kitchen-site",
   "repo_slug": "kitchen-site",
-  "local_path": "/Users/falco/AI/rainer-workspace/kitchen-site",
+  "local_path": "~/AI/rainer-workspace/kitchen-site",
   "deploy_command": "npx wrangler pages deploy . --project-name=kitchen-site --branch=main",
-  "artifact_root": "/Users/falco/AI/rainer-workspace/kitchen-site",
+  "artifact_root": "~/AI/rainer-workspace/kitchen-site",
   "preview_url": "https://...",
   "production_url": "https://kitchen.funkatorium.org/",
   "confidence": "dossier+receipt",
@@ -313,7 +313,7 @@ Example:
 ```bash
 MUSE_BRAIN_API_KEY=... \
 node scripts/repo-receipt-sync.mjs \
-  --repo /Users/falco/AI/rainer-workspace/muse-brain-public \
+  --repo ~/AI/rainer-workspace/muse-brain-public \
   --project-name "MUSE Brain"
 ```
 

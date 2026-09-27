@@ -305,7 +305,7 @@ The dream engine exists because static memory retrieval misses the connections t
 
 ## 9) Daemon architecture — 11 autonomous loops
 
-Orchestrator: `src/daemon/index.ts`. Runs every 15 minutes.
+Orchestrator: `src/daemon/index.ts`. Runs nightly (`03:00 UTC`) via the box runner (`daemon-runner/main.ts`, systemd `rook-brain-daemon.timer`); the Worker no longer schedules it.
 
 ### Execution order
 

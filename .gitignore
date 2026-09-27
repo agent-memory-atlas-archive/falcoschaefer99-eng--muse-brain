@@ -16,6 +16,11 @@ dist/
 runner/state/
 runner/config/tenants.json
 
+# Public-release gate's local name denylist — real person names, NEVER published.
+# See ops/.release-name-denylist.local.example for the format.
+ops/.release-name-denylist.local
+
 # Runner session telemetry (leaks cost/model/tenant — never commit)
 audit.jsonl
 *.jsonl
+muse-brain/benchmarks/relbench/

@@ -847,9 +847,9 @@ Most AI "learning" is prompt engineering or fine-tuning. Captured skills are nei
 
 ## Daemon Intelligence
 
-**11 autonomous loops, every 15 minutes**
+**11 autonomous loops, nightly**
 
-The daemon is the brain's background cognition. It runs every 15 minutes, per tenant, generating proposals and maintaining memory health.
+The daemon is the brain's background cognition. It runs nightly (`03:00 UTC`, box runner `daemon-runner/main.ts` under `rook-brain-daemon.timer`), per tenant, generating proposals and maintaining memory health. The Cloudflare Worker no longer schedules it — see `wrangler.jsonc.example` for the self-hoster choice.
 
 ### The 11 daemon tasks
 

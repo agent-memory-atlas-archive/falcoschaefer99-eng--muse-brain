@@ -1,6 +1,7 @@
 import type { Observation } from "../types";
-import type { IBrainStorage } from "../storage/interface";
+import type { IBrainStorage, LaneProbeResult } from "../storage/interface";
 import type { RetrievalProfile } from "../retrieval/query-signals";
+import { resolveCandidatePoolForProfile } from "../retrieval/scoring";
 import type {
 	BenchmarkArtifact,
 	BenchmarkCase,
@@ -64,6 +65,8 @@ export function buildCaseResult(
 	options?: {
 		force_miss_category?: BenchmarkCaseResult["miss_category"];
 		run_error?: string;
+		/** Profile-independent probe (same query/embedding); final_rank is derived here, per-profile. */
+		lane_probe?: LaneProbeResult;
 	}
 ): BenchmarkCaseResult {
 	const recallAt: Record<string, number> = {};
@@ -83,8 +86,38 @@ export function buildCaseResult(
 	if (options?.force_miss_category) missCategory = options.force_miss_category;
 	else if (testCase.skip_retrieval_reason === "abstention") missCategory = "abstention";
 	else if (testCase.skip_retrieval_reason === "missing_evidence") missCategory = "missing_evidence";
+	// Probes have zero evidence_ids by construction, so hitRanks is always empty —
+	// without this branch they'd fall into "no_results" (clean) or "candidate_miss"
+	// (leaky), silently polluting those tallies with a case type that isn't a real
+	// recall miss. See BenchmarkCaseResult.miss_category in types.ts.
+	else if (testCase.expect_no_results === true) missCategory = "false_positive_probe";
 	else if (returnedIds.length === 0) missCategory = "no_results";
 	else if (hitRanks.length === 0) missCategory = "candidate_miss";
+
+	const topScore = topResults.length > 0 ? topResults[0].score : undefined;
+	// min_similarity already gates what hybridSearch can return, so "returned
+	// something" already means "cleared the confidence bar" — see the field doc.
+	const falsePositive = testCase.expect_no_results === true ? returnedIds.length > 0 : undefined;
+
+	const laneProbeResult = options?.lane_probe;
+	const laneProbe = laneProbeResult
+		? {
+			depth: laneProbeResult.depth,
+			vector_top1: laneProbeResult.lanes.vector.top1,
+			vector_at_depth: laneProbeResult.lanes.vector.at_depth,
+			items: laneProbeResult.items.map(item => {
+				const finalIndex = returnedIds.indexOf(item.id);
+				return {
+					evidence_id: item.id,
+					vector_position: item.vector_position,
+					vector_similarity: item.vector_similarity,
+					keyword_position: item.keyword_position,
+					keyword_ts_rank: item.keyword_ts_rank,
+					final_rank: finalIndex === -1 ? null : finalIndex + 1
+				};
+			})
+		}
+		: undefined;
 
 	return {
 		case_id: testCase.id,
@@ -102,7 +135,92 @@ export function buildCaseResult(
 		miss_category: missCategory,
 		run_error: options?.run_error,
 		top_results: topResults,
-		metadata: testCase.metadata
+		top_score: topScore,
+		expect_no_results: testCase.expect_no_results,
+		false_positive: falsePositive,
+		metadata: testCase.metadata,
+		...(laneProbe ? { lane_probe: laneProbe } : {})
+	};
+}
+
+const VECTOR_RECALL_CUTOFFS = [10, 50, 100] as const;
+const KEYWORD_RECALL_CUTOFFS = [10, 30, 100] as const;
+
+/**
+ * Aggregates lane_probe data across a profile's evaluated cases into the three
+ * §7/§8 diagnostics. Returns undefined when no case in this run carried a
+ * lane_probe (i.e. lane_probe wasn't enabled) — there's nothing to report.
+ */
+export function computeLaneDiagnostics(
+	evaluated: BenchmarkCaseResult[],
+	profile: RetrievalProfile
+): Pick<BenchmarkProfileSummary, "lane_recall" | "fusion_fidelity" | "pool_ceiling"> | undefined {
+	const probed = evaluated.filter(result => result.lane_probe);
+	if (probed.length === 0) return undefined;
+
+	const pools = resolveCandidatePoolForProfile(profile);
+
+	let totalItems = 0;
+	const vectorHits: Record<number, number> = { 10: 0, 50: 0, 100: 0 };
+	const keywordHits: Record<number, number> = { 10: 0, 30: 0, 100: 0 };
+	let unionHits100 = 0;
+	let laneTop10Items = 0;
+	let retainedInFinalTop10 = 0;
+	let reachableItems = 0;
+	let ceilingSum = 0;
+
+	for (const result of probed) {
+		const items = result.lane_probe!.items;
+		totalItems += items.length;
+		let reachableInCase = 0;
+
+		for (const item of items) {
+			for (const cutoff of VECTOR_RECALL_CUTOFFS) {
+				if (item.vector_position !== null && item.vector_position <= cutoff) vectorHits[cutoff]++;
+			}
+			for (const cutoff of KEYWORD_RECALL_CUTOFFS) {
+				if (item.keyword_position !== null && item.keyword_position <= cutoff) keywordHits[cutoff]++;
+			}
+			const inVectorTop100 = item.vector_position !== null && item.vector_position <= 100;
+			const inKeywordTop100 = item.keyword_position !== null && item.keyword_position <= 100;
+			if (inVectorTop100 || inKeywordTop100) unionHits100++;
+
+			if (item.vector_position !== null && item.vector_position <= 10) {
+				laneTop10Items++;
+				if (item.final_rank !== null && item.final_rank <= 10) retainedInFinalTop10++;
+			}
+
+			const reachableInLane =
+				(item.vector_position !== null && item.vector_position <= pools.vector)
+				|| (item.keyword_position !== null && item.keyword_position <= pools.keyword);
+			if (reachableInLane) reachableInCase++;
+		}
+
+		reachableItems += reachableInCase;
+		if (items.length > 0) ceilingSum += Math.min(reachableInCase, 10) / items.length;
+	}
+
+	// null (not 0) on a zero denominator — "nothing to measure" is not "measured
+	// and it was zero". A caller printing a bare 0 would read as "0% fidelity" /
+	// "0% ceiling" instead of "n/a, no evidence reached this lane at all".
+	const fraction = (hits: number): number | null => totalItems > 0 ? Number((hits / totalItems).toFixed(4)) : null;
+
+	return {
+		lane_recall: {
+			vector: { "10": fraction(vectorHits[10]), "50": fraction(vectorHits[50]), "100": fraction(vectorHits[100]) },
+			keyword: { "10": fraction(keywordHits[10]), "30": fraction(keywordHits[30]), "100": fraction(keywordHits[100]) },
+			union: { "100": fraction(unionHits100) }
+		},
+		fusion_fidelity: {
+			lane_top10_items: laneTop10Items,
+			retained_in_final_top10: retainedInFinalTop10,
+			ratio: laneTop10Items > 0 ? Number((retainedInFinalTop10 / laneTop10Items).toFixed(4)) : null
+		},
+		pool_ceiling: {
+			reachable_items: reachableItems,
+			total_items: totalItems,
+			max_mean_recall: probed.length > 0 ? Number((ceilingSum / probed.length).toFixed(4)) : null
+		}
 	};
 }
 
@@ -116,6 +234,10 @@ export function summarizeProfile(
 			result.miss_category !== "abstention"
 			&& result.miss_category !== "missing_evidence"
 			&& result.miss_category !== "run_error"
+			// False-positive probes run hybridSearch for real, but recall/ndcg against
+			// zero evidence ids is always 0 by construction — mixing that into the
+			// recall aggregate would silently tank it. They get their own metric below.
+			&& result.expect_no_results !== true
 	);
 	const skipped = results.length - evaluated.length;
 	const recallAt: Record<string, number> = {};
@@ -139,6 +261,13 @@ export function summarizeProfile(
 		? Number((evaluated.filter(result => result.candidate_hit).length / evaluated.length).toFixed(4))
 		: 0;
 
+	const falsePositiveProbes = results.filter(result => result.expect_no_results === true);
+	const falsePositiveRate = falsePositiveProbes.length > 0
+		? Number((falsePositiveProbes.filter(result => result.false_positive === true).length / falsePositiveProbes.length).toFixed(4))
+		: undefined;
+
+	const laneDiagnostics = computeLaneDiagnostics(evaluated, profile);
+
 	return {
 		profile,
 		evaluated_cases: evaluated.length,
@@ -146,7 +275,9 @@ export function summarizeProfile(
 		recall_at: recallAt,
 		ndcg_at: ndcgAt,
 		candidate_hit_rate: candidateHitRate,
-		miss_categories: missCategories
+		miss_categories: missCategories,
+		...(falsePositiveRate !== undefined ? { false_positive_rate: falsePositiveRate } : {}),
+		...(laneDiagnostics ?? {})
 	};
 }
 
@@ -155,7 +286,38 @@ export interface BenchmarkHarnessOptions {
 	backend: "sqlite" | "postgres";
 	run_config: BenchmarkRunConfig;
 	cases: BenchmarkCase[];
+	/** Document-side embedder — always unprefixed (ADR-RETRIEVAL-FUSION-RETUNE §5 item 1). */
 	embed_text?: (text: string) => Promise<number[]>;
+	/**
+	 * Query-side embedder. Falls back to embed_text when absent, so a caller that
+	 * only supplies embed_text keeps embedding queries and documents identically
+	 * (today's behavior, and the only path exercised before this option existed).
+	 */
+	embed_query?: (text: string) => Promise<number[]>;
+	/**
+	 * Echoed verbatim into BenchmarkArtifact.config for provenance, same role as
+	 * vector_enabled below — the harness never reads this to decide anything, it
+	 * just calls whichever function(s) it's given. Records whether the supplied
+	 * embed_query applied the BGE query instruction prefix.
+	 */
+	embed_query_prefix?: boolean;
+}
+
+/**
+ * A depth smaller than a benchmarked profile's own candidate_pool would silently
+ * understate reachability for that profile (a case's evidence could sit at
+ * position 60 in the vector lane — reachable within `balanced`'s pool of 80 —
+ * but probeLanes at depth 50 would never see it, reporting an artificially low
+ * ceiling). Raise (never lower) the configured depth to cover the largest
+ * vector/keyword pool among the profiles actually being run this call.
+ */
+function computeEffectiveLaneProbeDepth(configuredDepth: number, profiles: RetrievalProfile[]): number {
+	let maxPool = 0;
+	for (const profile of profiles) {
+		const pools = resolveCandidatePoolForProfile(profile);
+		maxPool = Math.max(maxPool, pools.vector, pools.keyword);
+	}
+	return Math.max(configuredDepth, maxPool);
 }
 
 export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Promise<BenchmarkArtifact> {
@@ -163,6 +325,19 @@ export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Pro
 	const storage = options.storage;
 	const caseResults: BenchmarkCaseResult[] = [];
 	const runIssues: BenchmarkRunIssue[] = [];
+
+	let effectiveLaneProbeDepth: number | undefined;
+	if (options.run_config.lane_probe?.enabled) {
+		effectiveLaneProbeDepth = computeEffectiveLaneProbeDepth(
+			options.run_config.lane_probe.depth,
+			options.run_config.profiles
+		);
+		if (effectiveLaneProbeDepth > options.run_config.lane_probe.depth) {
+			console.log(
+				`[lane_probe] raised depth ${options.run_config.lane_probe.depth} -> ${effectiveLaneProbeDepth} to cover the largest run profile's candidate_pool`
+			);
+		}
+	}
 
 	for (const testCase of options.cases) {
 		if (testCase.skip_retrieval_reason) {
@@ -201,7 +376,7 @@ export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Pro
 		let queryEmbedding: number[] | undefined;
 		if (caseReadyForQuery && options.embed_text) {
 			try {
-				queryEmbedding = await options.embed_text(testCase.query);
+				queryEmbedding = await (options.embed_query ?? options.embed_text)(testCase.query);
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				runIssues.push({
@@ -210,6 +385,27 @@ export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Pro
 					message: `query_embedding: ${message}`
 				});
 				caseReadyForQuery = false;
+			}
+		}
+
+		// Profile-independent: same query/embedding regardless of which profile scores
+		// it, so probe once per case, not once per (case, profile) pair.
+		let laneProbe: LaneProbeResult | undefined;
+		if (caseReadyForQuery && options.run_config.lane_probe?.enabled && testCase.evidence_ids.length > 0) {
+			try {
+				laneProbe = await storage.probeLanes({
+					query: testCase.query,
+					embedding: queryEmbedding,
+					ids: testCase.evidence_ids,
+					depth: effectiveLaneProbeDepth ?? options.run_config.lane_probe.depth
+				});
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				runIssues.push({
+					case_id: testCase.id,
+					stage: "lane_probe",
+					message
+				});
 			}
 		}
 
@@ -237,7 +433,8 @@ export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Pro
 					limit: options.run_config.result_limit,
 					min_similarity: options.run_config.min_similarity,
 					rerank_mode: options.run_config.rerank_mode,
-					rerank_top_n: options.run_config.rerank_top_n
+					rerank_top_n: options.run_config.rerank_top_n,
+					profile_overrides: options.run_config.profile_overrides
 				});
 
 				caseResults.push(buildCaseResult(
@@ -249,7 +446,8 @@ export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Pro
 						score: Number(result.score.toFixed(4)),
 						match_sources: result.match_sources
 					})),
-					options.run_config.top_k
+					options.run_config.top_k,
+					laneProbe ? { lane_probe: laneProbe } : undefined
 				));
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -303,7 +501,8 @@ export async function runBenchmarkHarness(options: BenchmarkHarnessOptions): Pro
 		config: {
 			...options.run_config,
 			backend: options.backend,
-			vector_enabled: Boolean(options.embed_text)
+			vector_enabled: Boolean(options.embed_text),
+			embed_query_prefix: Boolean(options.embed_query_prefix)
 		},
 		profile_summaries: profileSummaries,
 		profile_comparison: profileSummaries.map(summary => ({
@@ -338,6 +537,7 @@ export function renderBenchmarkSummaryMarkdown(artifact: BenchmarkArtifact): str
 		`- Completed: ${artifact.run_completed_at}`,
 		`- Backend: ${artifact.config.backend}`,
 		`- Vector enabled: ${artifact.config.vector_enabled}`,
+		`- Embed query prefix: ${artifact.config.embed_query_prefix}`,
 		`- Run issues: ${artifact.run_issues.length}`,
 		"",
 		`| ${headerColumns.join(" | ")} |`,
@@ -348,6 +548,53 @@ export function renderBenchmarkSummaryMarkdown(artifact: BenchmarkArtifact): str
 		const recallCells = effectiveTopK.map(k => summary.recall_at[String(k)] ?? 0);
 		const ndcgCells = effectiveTopK.map(k => summary.ndcg_at[String(k)] ?? 0);
 		lines.push(`| ${summary.profile} | ${[...recallCells, ...ndcgCells, summary.candidate_hit_rate, summary.evaluated_cases, summary.skipped_cases].join(" | ")} |`);
+	}
+
+	// Lane diagnostics (ADR-RETRIEVAL-FUSION-RETUNE §8) — only present when
+	// `BenchmarkRunConfig.lane_probe.enabled` was true for this run.
+	for (const summary of artifact.profile_summaries) {
+		if (!summary.lane_recall && !summary.fusion_fidelity && !summary.pool_ceiling) continue;
+
+		lines.push("", `## Lane diagnostics — ${summary.profile}`);
+
+		const probedCases = artifact.case_results.filter(result => result.profile === summary.profile && result.lane_probe);
+		if (probedCases.length > 0) {
+			lines.push(
+				"",
+				"| Case | Evidence ID | Vector Position | Vector Sim | Keyword Position | Keyword ts_rank | Final Rank |",
+				"| --- | --- | ---: | ---: | ---: | ---: | ---: |"
+			);
+			for (const result of probedCases) {
+				for (const item of result.lane_probe!.items) {
+					const vectorSim = item.vector_similarity !== null ? item.vector_similarity.toFixed(4) : "-";
+					const keywordTsRank = item.keyword_ts_rank !== null ? item.keyword_ts_rank.toFixed(4) : "-";
+					lines.push(
+						`| ${result.case_id} | ${item.evidence_id} | ${item.vector_position ?? "-"} | ${vectorSim} | ${item.keyword_position ?? "-"} | ${keywordTsRank} | ${item.final_rank ?? "-"} |`
+					);
+				}
+			}
+		}
+
+		if (summary.lane_recall) {
+			const { vector, keyword, union } = summary.lane_recall;
+			const pct = (value: number | null): string => value === null ? "n/a" : `${(value * 100).toFixed(1)}%`;
+			lines.push(
+				"",
+				`- Lane recall: vector@10 ${pct(vector["10"])}, vector@50 ${pct(vector["50"])}, vector@100 ${pct(vector["100"])}, `
+				+ `keyword@10 ${pct(keyword["10"])}, keyword@30 ${pct(keyword["30"])}, keyword@100 ${pct(keyword["100"])}, `
+				+ `union@100 ${pct(union["100"])}`
+			);
+		}
+		if (summary.fusion_fidelity) {
+			const { retained_in_final_top10, lane_top10_items, ratio } = summary.fusion_fidelity;
+			const ratioText = ratio === null ? "n/a (0 items)" : String(ratio);
+			lines.push("", `- Fusion fidelity: ${retained_in_final_top10}/${lane_top10_items} = ${ratioText}`);
+		}
+		if (summary.pool_ceiling) {
+			const { reachable_items, total_items, max_mean_recall } = summary.pool_ceiling;
+			const ceilingText = max_mean_recall === null ? "n/a (0 items)" : String(max_mean_recall);
+			lines.push(`- Pool ceiling (${summary.profile}): ${reachable_items}/${total_items} evidence items reachable, max mean R@10 = ${ceilingText}`);
+		}
 	}
 
 	return lines.join("\n");

@@ -9,7 +9,8 @@ import {
 	EMOTION_PROXIMITY,
 	DREAM_GRIP_WEIGHT,
 	MOMENTUM_DECAY_HOURS,
-	AFTERGLOW_HOURS
+	AFTERGLOW_HOURS,
+	FOUNDATIONAL_LANE_CAP
 } from "./constants";
 
 /** Generate L0 summary from observation. Pure string ops, nanoseconds. */
@@ -151,6 +152,27 @@ export function calculatePullStrength(observation: Observation): number {
 	const accessScore = Math.min((observation.access_count || 1) / 10.0, 1.0);
 
 	return Math.round(((gripScore * 0.4) + (chargeScore * 0.3) + (recencyScore * 0.2) + (accessScore * 0.1)) * 1000) / 1000;
+}
+
+/**
+ * ops/ADR-JANITOR.md §5.1 — the truncation both storage backends'
+ * readFoundationalObservations() apply, in ONE place so postgres.ts and sqlite.ts
+ * can't drift into ranking by two different measures again. Ranks by
+ * calculatePullStrength DESCENDING and slices to `cap` — the same measure and
+ * direction tools-v2/wake.ts's buildFoundationLane already re-ranks by, so what
+ * survives the cap is the most-alive rows, not merely the newest. Previously each
+ * backend truncated by `created_at DESC` before the lane ever ranked anything,
+ * silently dropping high-pull-strength old memories the ranker never got to see.
+ */
+export function rankFoundationalByPullStrength<T extends { observation: Observation }>(
+	rows: T[],
+	cap: number = FOUNDATIONAL_LANE_CAP
+): T[] {
+	return rows
+		.map(row => ({ row, pull: calculatePullStrength(row.observation) }))
+		.sort((a, b) => b.pull - a.pull)
+		.slice(0, cap)
+		.map(({ row }) => row);
 }
 
 // ============ SMART OBSERVE PARSING ============

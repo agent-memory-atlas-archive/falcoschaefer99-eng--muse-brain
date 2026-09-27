@@ -26,6 +26,12 @@ export interface Env {
 	TENANT_ALIASES?: string;            // CSV "alias:canonical" pairs, e.g. "rook:companion"
 	CROSS_TENANT_READ_GRANTS?: string;  // CSV "granter:granted" pairs, e.g. "rainer:companion"
 	LEASE_ENFORCEMENT_MODE?: "off" | "shadow" | "required"; // v1.8 trust layer: shadow by default for legacy clients
+	// Controls the BGE query instruction prefix on query-side embeddings
+	// (ADR-RETRIEVAL-FUSION-RETUNE §5 item 1). Default ON — A/B 2026-09-05 kept
+	// it (SWEEP-2026-09-05.md §prefix); set EMBED_QUERY_PREFIX=0 to disable.
+	// "0"/"false" (case-insensitive) turns it off, "1"/"true" confirms it on.
+	// See src/embedding/index.ts.
+	EMBED_QUERY_PREFIX?: string;
 }
 
 export interface Texture {
@@ -36,6 +42,15 @@ export interface Texture {
 	grip: string;
 	charge_phase?: "fresh" | "active" | "processing" | "metabolized";
 	novelty_score?: number;
+	/**
+	 * @deprecated Dead — never written by any code path. `updateSurfacingEffects`
+	 * mirrors only `novelty_score` into `texture` on both backends (verified
+	 * ops/ADR-JANITOR.md §2.1 instances six/nine); this key is never set. The
+	 * real value lives on `Observation.last_surfaced_at`, a plain column, not a
+	 * texture key. The one remaining reader, `daemon/cycle.ts`'s novelty-regen
+	 * stage, is itself the fourth site of the same defect and is tracked
+	 * separately (§2.1), out of scope to fix here — do not add a second reader.
+	 */
 	last_surfaced_at?: string;
 }
 
@@ -48,6 +63,13 @@ export interface Observation {
 	context?: string;
 	mood?: string;
 	last_accessed?: string;
+	/**
+	 * ops/ADR-JANITOR.md §2.1 instance nine (commit 7c) — the real `observations.last_surfaced_at`
+	 * TIMESTAMPTZ column (`migrations/001_initial_schema.sql:74`), mapped through by both backends'
+	 * row-mappers. NOT the same as `texture.last_surfaced_at` (there is no such texture key in
+	 * practice — `updateSurfacingEffects` only ever mirrors `novelty_score` into texture, per §5.2).
+	 */
+	last_surfaced_at?: string;
 	access_count: number;
 	links?: string[];
 	summary?: string;  // L0: truncated excerpt with grip/charge markers. NOT sanitized — escape before HTML rendering.
@@ -210,6 +232,11 @@ export interface ParsedObservation {
 	was_parsed: boolean;       // Whether smart parsing was applied
 }
 
+// Discriminates WakeLogEntry rows by producer — see WakeLogEntry.kind below. Distinct
+// from AgentRuntimeWakeKind (duty|impulse, a different field on a different concept);
+// don't merge or rename either.
+export type WakeLogKind = "auto" | "manual";
+
 export interface WakeLogEntry {
 	id: string;
 	timestamp: string;
@@ -218,6 +245,30 @@ export interface WakeLogEntry {
 	iron_pulls?: string[];
 	mood?: unknown;
 	phase?: string;
+	// Which producer wrote this row — "auto" (finalizeWakePayload, every mind_wake call)
+	// or "manual" (mind_wake_log action=log). The field this discriminator's absent-field
+	// contract depends on (see foundation_ids/anchor_ids below) — keep it a real type, not
+	// a string that happens to work.
+	kind?: WakeLogKind;
+	// Ids of the foundation-lane items actually served on this wake (post char-cap
+	// truncation — see wake.ts's finalizeWakePayload/capFoundationLane). Only "auto" rows
+	// (kind === "auto", written by finalizeWakePayload) ever populate these; "manual" rows
+	// (kind === "manual", written by mind_wake_log action=log) never do, on any date,
+	// because that path never touches the foundation lane. Check `kind` before drawing any
+	// conclusion from an absent field.
+	//   - absent (key missing entirely): predates the field, OR kind === "manual".
+	//   - []: we queried and there was genuinely nothing to serve.
+	//   - null (anchor_ids only): we deliberately did NOT query — the lease presented on
+	//     this wake lacked identity.read, so anchors never entered the payload at all.
+	//     `anchors_omitted` carries the reason string for this case.
+	// foundation_ids has no null state: present means queried (possibly to []); absent
+	// means predates the field or kind === "manual" — same caveat as above.
+	foundation_ids?: string[];
+	anchor_ids?: string[] | null;
+	// Present only when anchor_ids is null — the reason anchors were never queried this
+	// wake (mirrors FoundationLane.anchors_omitted, src/tools-v2/wake.ts). Absent on every
+	// other row, including legacy rows that predate both fields.
+	anchors_omitted?: string;
 	[key: string]: unknown;    // Allow additional fields from different wake types
 }
 
@@ -417,6 +468,7 @@ export type DaemonProposalType =
 	| 'orphan_rescue'
 	| 'consolidation'
 	| 'dedup'
+	| 'salience_regrade'
 	| 'cross_agent'
 	| 'cross_tenant'
 	| 'paradox_detected'
@@ -430,6 +482,17 @@ export type DaemonProposalType =
 	| 'missing_artifact_receipt'
 	| 'stale_deploy_command'
 	| 'path_alias_conflict';
+
+/**
+ * proposal_type values that expireStaleProposals() is allowed to DELETE once
+ * pending too long. A module constant, never read from daemon_config or any other
+ * runtime-writable source — ops/ADR-JANITOR.md §1's explicit flag for Michael: a
+ * config write must never become a delete primitive. Every other proposal_type is
+ * a judgment queued for Rook's review; a rejection there is a deliberate,
+ * permanent tombstone (the SAME status-blind unique index that is a bug for these
+ * two types is the anti-nag guarantee for those — see §1 and §5.5).
+ */
+export const EXPIRABLE_PROPOSAL_TYPES: readonly DaemonProposalType[] = Object.freeze(['link', 'orphan_rescue']);
 
 export interface DaemonProposal {
 	id: string;
@@ -755,4 +818,33 @@ export interface AgentAuditEventFilter {
 	result?: AgentAuditResult;
 	created_after?: string;
 	limit?: number;
+}
+
+// --- Valence Lexicon (ADR-VALENCE-FLOOR.md, slice 0) ---
+
+/**
+ * ops/ADR-VALENCE-FLOOR.md — valence is a property of the CHARGE VOCABULARY,
+ * not of any single memory: a per-tenant table, one row per distinct charge
+ * string, classified once and reused by every observation that carries it.
+ * "mixed" and "neutral" are both real, distinct outcomes from "unclassified"
+ * (absence of a row) — a charge with no row is fail-closed unknown, never
+ * defaulted to neutral (the ADR's explicit failure-mode requirement).
+ */
+export type ChargeValence = "positive" | "negative" | "mixed" | "neutral";
+
+/**
+ * One row per distinct charge string, per tenant. `tenant_id` is deliberately
+ * NOT a field here — every IBrainStorage instance is already tenant-scoped
+ * (same convention as Observation/DaemonConfig), so the storage layer adds
+ * tenant scoping in SQL/kv-key, not the caller.
+ */
+export interface ChargeValenceRow {
+	charge: string;
+	valence: ChargeValence;
+	method: "llm" | "manual";
+	/** Exact model id used to classify (e.g. "@cf/meta/llama-3.2-3b-instruct"). */
+	model: string;
+	classified_at: string;
+	/** Corpus frequency of this charge string — recomputed every nightly run. */
+	observation_count: number;
 }

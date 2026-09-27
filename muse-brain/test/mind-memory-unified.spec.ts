@@ -177,7 +177,7 @@ describe("mind_memory action=lookup", () => {
 			metadata: {
 				workspace_routing: {
 					repo_slug: "brain-surgery",
-					local_paths: ["/Users/falco/AI/rainer-workspace/brain-surgery"],
+					local_paths: ["/home/user/AI/rainer-workspace/brain-surgery"],
 					path_aliases: ["brain surgery repo"]
 				}
 			}
@@ -207,7 +207,7 @@ describe("mind_memory action=lookup", () => {
 		expect(result.project.recent_observations).toBeDefined();
 		expect(result.project.workspace_routing).toEqual(expect.objectContaining({
 			repo_slug: "brain-surgery",
-			local_workspace: "/Users/falco/AI/rainer-workspace/brain-surgery"
+			local_workspace: "/home/user/AI/rainer-workspace/brain-surgery"
 		}));
 	});
 
@@ -218,7 +218,7 @@ describe("mind_memory action=lookup", () => {
 			metadata: {
 				workspace_routing: {
 					repo_slug: "dupin-service",
-					local_paths: ["/Users/falco/AI/rainer-workspace/dupin-service"],
+					local_paths: ["/home/user/AI/rainer-workspace/dupin-service"],
 					path_aliases: ["inspector service"]
 				}
 			}
@@ -1880,5 +1880,78 @@ describe("mind_query input validation (Fix 3 and Fix 4)", () => {
 		expect(storage.readAllTerritories).not.toHaveBeenCalled();
 		expect(result.count).toBe(1);
 		expect(result.observations[0].id).toBe("obs_filter_lane");
+	});
+});
+
+describe("mind_query side_effects flag (ADR-RETRIEVAL-FUSION-RETUNE §4 hard prerequisite)", () => {
+	// Pinned (not `new Date().toISOString()`): the side_effects:false test below runs
+	// two separate hybridSearch mocks back-to-back and asserts their `observations`
+	// arrays are deep-equal, including each observation's `created` field. A live
+	// timestamp computed fresh per mock invocation can tick a millisecond between the
+	// two calls and break that equality — rare, but flaky (~1/7 runs observed).
+	const SIDE_EFFECT_FIXTURE_CREATED = "2026-08-01T00:00:00.000Z";
+
+	function makeSideEffectStorage() {
+		return {
+			hybridSearch: vi.fn(async () => ([
+				{
+					observation: makeObservation("obs_query_footprint", SIDE_EFFECT_FIXTURE_CREATED),
+					territory: "craft",
+					score: 0.7,
+					match_sources: ["vector"]
+				}
+			])),
+			findEntityById: vi.fn(async () => null),
+			findEntityByName: vi.fn(async () => null),
+			recordMemoryCascade: vi.fn(async () => undefined),
+			updateSurfacingEffects: vi.fn(async () => undefined)
+		};
+	}
+
+	it("defaults to firing surfacing side effects", async () => {
+		const storage = makeSideEffectStorage();
+		const context = { storage: storage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+
+		const result = await handleMemoryTool("mind_query", { query: "footprint default" }, context);
+
+		expect(result.confidence.side_effects).toBe(true);
+		expect(storage.recordMemoryCascade).toHaveBeenCalledWith(["obs_query_footprint"]);
+		expect(storage.updateSurfacingEffects).toHaveBeenCalledWith(["obs_query_footprint"]);
+	});
+
+	it("side_effects:false leaves no surfacing footprint and returns identical results", async () => {
+		const defaultStorage = makeSideEffectStorage();
+		const defaultContext = { storage: defaultStorage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+		const defaultResult = await handleMemoryTool("mind_query", { query: "footprint compare" }, defaultContext);
+
+		const noEffectStorage = makeSideEffectStorage();
+		const noEffectContext = { storage: noEffectStorage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+		const noEffectResult = await handleMemoryTool("mind_query", { query: "footprint compare", side_effects: false }, noEffectContext);
+
+		expect(noEffectResult.confidence.side_effects).toBe(false);
+		expect(noEffectStorage.recordMemoryCascade).not.toHaveBeenCalled();
+		expect(noEffectStorage.updateSurfacingEffects).not.toHaveBeenCalled();
+		expect(noEffectResult.observations).toEqual(defaultResult.observations);
+	});
+
+	it("rejects a non-boolean side_effects value", async () => {
+		const storage = makeSideEffectStorage();
+		const context = { storage: storage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+
+		const result = await handleMemoryTool("mind_query", { query: "footprint invalid", side_effects: "yes" }, context);
+
+		expect(result.error).toMatch(/side_effects must be a boolean/i);
+		expect(storage.hybridSearch).not.toHaveBeenCalled();
+	});
+
+	it("forwards side_effects:false through mind_memory action=search to mind_query", async () => {
+		const storage = makeSideEffectStorage();
+		const context = { storage: storage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+
+		const result = await handleMemoryTool("mind_memory", { action: "search", query: "footprint via mind_memory", side_effects: false }, context);
+
+		expect(result.confidence.side_effects).toBe(false);
+		expect(storage.recordMemoryCascade).not.toHaveBeenCalled();
+		expect(storage.updateSurfacingEffects).not.toHaveBeenCalled();
 	});
 });

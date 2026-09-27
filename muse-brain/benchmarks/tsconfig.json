@@ -6,6 +6,7 @@
 		"rootDir": "..",
 		"module": "CommonJS",
 		"moduleResolution": "Node",
+		"esModuleInterop": true,
 		"types": ["node", "../worker-configuration.d.ts"]
 	},
 	"include": [

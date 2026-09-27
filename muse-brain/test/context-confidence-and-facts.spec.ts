@@ -45,17 +45,21 @@ describe('context confidence gating', () => {
 
 		const result = await handleMemoryTool('mind_query', {
 			query: 'What did you say about "memory palace"?',
+			// "balanced" is a frozen alias of "fused" (ADR-RETRIEVAL-FUSION-RETUNE §9) —
+			// mind_query normalizes before it reaches hybridSearch or the response.
 			retrieval_profile: 'balanced'
 		}, { storage: storage as any });
 
-		expect(result.retrieval_profile).toBe('balanced');
+		expect(result.retrieval_profile).toBe('fused');
 		expect(result.query_signals.quoted_phrases).toContain('memory palace');
 		expect(storage.hybridSearch).toHaveBeenCalledWith(expect.objectContaining({
-			retrieval_profile: 'balanced',
+			retrieval_profile: 'fused',
 			query_signals: expect.objectContaining({
 				quoted_phrases: expect.arrayContaining(['memory palace'])
 			})
 		}));
+		// The mocked hybridSearch result's own score_breakdown.profile is opaque
+		// passthrough data — mind_query forwards it verbatim, unrelated to normalization.
 		expect(result.observations[0].score_breakdown.profile).toBe('balanced');
 	});
 
@@ -183,6 +187,32 @@ describe('context confidence gating', () => {
 		expect(result.results[0].confidence).toBe(0.75);
 	});
 
+	it('defaults recency_boost to 0.05 when the caller passes nothing (band migration, ADR §1: 0.15 -> 0.05)', async () => {
+		const now = Date.now();
+		const storage = {
+			hybridSearch: vi.fn(async () => ([
+				{
+					observation: makeObservation('obs_default_recency', new Date(now - 1 * 24 * 60 * 60 * 1000).toISOString()),
+					territory: 'craft',
+					score: 0.60,
+					match_sources: ['vector']
+				}
+			])),
+			findEntityById: vi.fn(async () => null),
+			findEntityByName: vi.fn(async () => null)
+		};
+
+		// No recency_boost / recency_boost_days passed — must fall back to
+		// CONFIDENCE_DEFAULTS (recency_boost_days: 3, recency_boost: 0.05).
+		const result = await handleSearchTool('mind_search', {
+			query: 'default recency boost'
+		}, { storage: storage as any });
+
+		expect(result.confidence.recency_boost_days).toBe(3);
+		expect(result.confidence.recency_boost).toBe(0.05);
+		expect(result.results[0].confidence).toBeCloseTo(0.65, 5);
+	});
+
 	it('falls back to findEntityByName when findEntityById misses before hybrid search', async () => {
 		const storage = {
 			hybridSearch: vi.fn(async () => []),
@@ -201,6 +231,68 @@ describe('context confidence gating', () => {
 		expect(storage.hybridSearch).toHaveBeenCalledWith(expect.objectContaining({
 			entity_id: 'entity_project_atlas'
 		}));
+	});
+});
+
+describe('mind_search side_effects flag (ADR-RETRIEVAL-FUSION-RETUNE §4 hard prerequisite)', () => {
+	// Pinned (not `new Date().toISOString()`): the side_effects:false test below runs
+	// two separate hybridSearch mocks back-to-back and asserts their `results` arrays
+	// are deep-equal, including each observation's `created` field. A live timestamp
+	// computed fresh per mock invocation can tick a millisecond between the two calls
+	// and break that equality — rare, but flaky (~1/7 runs observed).
+	const SIDE_EFFECT_FIXTURE_CREATED = '2026-08-01T00:00:00.000Z';
+
+	function makeSideEffectStorage() {
+		return {
+			hybridSearch: vi.fn(async () => ([
+				{
+					observation: makeObservation('obs_footprint', SIDE_EFFECT_FIXTURE_CREATED),
+					territory: 'craft',
+					score: 0.7,
+					match_sources: ['vector']
+				}
+			])),
+			findEntityById: vi.fn(async () => null),
+			findEntityByName: vi.fn(async () => null),
+			recordMemoryCascade: vi.fn(async () => undefined),
+			updateSurfacingEffects: vi.fn(async () => undefined)
+		};
+	}
+
+	it('defaults to firing surfacing side effects', async () => {
+		const storage = makeSideEffectStorage();
+		const context = { storage: storage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+
+		const result = await handleSearchTool('mind_search', { query: 'footprint default' }, context);
+
+		expect(result.confidence.side_effects).toBe(true);
+		expect(storage.recordMemoryCascade).toHaveBeenCalledWith(['obs_footprint']);
+		expect(storage.updateSurfacingEffects).toHaveBeenCalledWith(['obs_footprint']);
+	});
+
+	it('side_effects:false leaves no surfacing footprint and returns identical results', async () => {
+		const defaultStorage = makeSideEffectStorage();
+		const defaultContext = { storage: defaultStorage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+		const defaultResult = await handleSearchTool('mind_search', { query: 'footprint compare' }, defaultContext);
+
+		const noEffectStorage = makeSideEffectStorage();
+		const noEffectContext = { storage: noEffectStorage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+		const noEffectResult = await handleSearchTool('mind_search', { query: 'footprint compare', side_effects: false }, noEffectContext);
+
+		expect(noEffectResult.confidence.side_effects).toBe(false);
+		expect(noEffectStorage.recordMemoryCascade).not.toHaveBeenCalled();
+		expect(noEffectStorage.updateSurfacingEffects).not.toHaveBeenCalled();
+		expect(noEffectResult.results).toEqual(defaultResult.results);
+	});
+
+	it('rejects a non-boolean side_effects value', async () => {
+		const storage = makeSideEffectStorage();
+		const context = { storage: storage as any, waitUntil: (p: Promise<unknown>) => { p.catch(() => {}); } };
+
+		const result = await handleSearchTool('mind_search', { query: 'footprint invalid', side_effects: 'yes' }, context);
+
+		expect(result.error).toMatch(/side_effects must be a boolean/i);
+		expect(storage.hybridSearch).not.toHaveBeenCalled();
 	});
 });
 

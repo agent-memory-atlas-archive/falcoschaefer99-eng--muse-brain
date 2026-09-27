@@ -1,7 +1,7 @@
 // ============ RUNTIME TOOL (v2) ============
 // mind_runtime — session continuity + runtime run ledger + lean wake policy.
 
-import { ALLOWED_TENANTS, CONFIDENCE_DEFAULTS } from "../constants";
+import { ALLOWED_TENANTS, CONFIDENCE_DEFAULTS, type TenantId } from "../constants";
 import type {
 	AgentRuntimeRun,
 	AgentRuntimeSession,
@@ -597,8 +597,8 @@ function resolveAgentTenant(context: ToolContext, value: unknown): { value: stri
 	return { error: `Not authorized for agent_tenant: ${cleaned} (no cross-tenant grant for ${fallback})` };
 }
 
-function isAllowedTenant(value: string): value is typeof ALLOWED_TENANTS[number] {
-	return ALLOWED_TENANTS.includes(value as typeof ALLOWED_TENANTS[number]);
+function isAllowedTenant(value: string): value is TenantId {
+	return ALLOWED_TENANTS.includes(value as TenantId);
 }
 
 function normalizeTriggerMode(value: unknown): AgentRuntimeSession["trigger_mode"] | undefined {

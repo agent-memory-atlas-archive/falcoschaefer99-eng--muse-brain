@@ -6,6 +6,42 @@ import { TERRITORIES, RESONANCE_TYPES, LINK_STRENGTHS, LOOP_STATUSES } from "../
 import { getTimestamp, generateId, extractEssence, calculatePullStrength } from "../helpers";
 import type { ToolContext } from "./context";
 
+/**
+ * Builds and persists a paradox open_loop. The one creation path for both
+ * callers below — mind_loop action=paradox (this file) and
+ * tools-v2/propose.ts's paradox_detected accept branch — so the two can never
+ * drift into building the OpenLoop shape differently.
+ *
+ * Deliberately carries NO minimum-length check on linked_entity_ids. The >=2
+ * rule enforced in the action=paradox branch below is an input-validation
+ * choice at that tool's boundary (a human/agent naming a paradox is expected
+ * to name both cores in friction) — it is not a data invariant. Neither the
+ * OpenLoop type, nor the open_loops table (linked_entity_ids TEXT[] DEFAULT
+ * '{}', migrations/006_sprint6_foundation.sql), nor storage.appendOpenLoop
+ * constrain the array's length. propose.ts's daemon-sourced accept path relies
+ * on that: paradox-detection.ts structurally can only ever name ONE core (see
+ * that file's header) — the detector never invents a counter-core — so it
+ * calls this function directly with a single-element array rather than going
+ * through the tool's stricter gate.
+ */
+export async function createParadoxLoop(
+	storage: ToolContext["storage"],
+	params: { content: string; linked_entity_ids: string[]; territory?: string; status?: string }
+): Promise<OpenLoop> {
+	const paradoxLoop: OpenLoop = {
+		id: generateId("loop"),
+		content: params.content,
+		status: params.status || "burning",
+		territory: storage.validateTerritory(params.territory || "self"),
+		created: getTimestamp(),
+		mode: "paradox",
+		linked_entity_ids: params.linked_entity_ids
+	};
+
+	await storage.appendOpenLoop(paradoxLoop);
+	return paradoxLoop;
+}
+
 export const TOOL_DEFS = [
 	{
 		name: "mind_link",
@@ -263,17 +299,12 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 					return { error: `Invalid entity ID format: ${invalidId}` };
 				}
 
-				const paradoxLoop: OpenLoop = {
-					id: generateId("loop"),
+				const paradoxLoop = await createParadoxLoop(storage, {
 					content: args.content,
-					status: args.status || "burning",
-					territory: storage.validateTerritory(args.territory || "self"),
-					created: getTimestamp(),
-					mode: 'paradox',
-					linked_entity_ids: args.linked_entity_ids as string[]
-				};
-
-				await storage.appendOpenLoop(paradoxLoop);
+					linked_entity_ids: args.linked_entity_ids as string[],
+					territory: args.territory,
+					status: args.status
+				});
 				return {
 					created: true,
 					id: paradoxLoop.id,

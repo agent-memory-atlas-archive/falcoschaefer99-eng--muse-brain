@@ -49,12 +49,18 @@ function parseArgs(argv) {
 		maxChangedPaths: MAX_CHANGED_PATHS
 	};
 
+	// --api-key is resolved after the loop so it can win over the env fallback
+	// chain above (same flag-over-env precedence as --repo/--endpoint/--tenant)
+	// while still printing exactly one warning about /proc/*/cmdline exposure —
+	// never logging the key itself.
+	let apiKeyFlag;
+
 	for (let i = 0; i < argv.length; i++) {
 		const token = argv[i];
 		if (token === "--repo" && argv[i + 1]) options.repo = argv[++i];
 		else if (token === "--endpoint" && argv[i + 1]) options.endpoint = argv[++i];
 		else if (token === "--tenant" && argv[i + 1]) options.tenant = argv[++i];
-		else if (token === "--api-key" && argv[i + 1]) options.apiKey = argv[++i];
+		else if (token === "--api-key" && argv[i + 1]) apiKeyFlag = argv[++i];
 		else if (token === "--project-id" && argv[i + 1]) options.projectEntityId = argv[++i];
 		else if (token === "--project-name" && argv[i + 1]) options.projectName = argv[++i];
 		else if (token === "--state" && argv[i + 1]) options.statePath = argv[++i];
@@ -78,7 +84,7 @@ Options:
   --repo <path>              Git checkout to read (default: cwd)
   --endpoint <url>           Brain base URL or /mcp URL
   --tenant <name>            Tenant header value (default: rainer)
-  --api-key <key>            Brain API key (or env MUSE_BRAIN_API_KEY)
+  --api-key <key>            Brain API key (discouraged — visible via /proc/*/cmdline; prefer env MUSE_BRAIN_API_KEY)
   --project-id <id>          Project entity id to link receipt to
   --project-name <name>      Project name lookup if id omitted
   --state <path>             State file (default: <repo>/${DEFAULT_STATE_NAME})
@@ -97,6 +103,14 @@ Options:
 		} else {
 			throw new Error(`Unknown or incomplete argument: ${token}`);
 		}
+	}
+
+	if (apiKeyFlag !== undefined) {
+		options.apiKey = apiKeyFlag;
+		// Never log the key itself — only the fact that the flag was used.
+		console.warn(
+			"[repo-receipt-sync] --api-key passed on the command line is visible in /proc/*/cmdline to every user on this host; prefer the MUSE_BRAIN_API_KEY environment variable"
+		);
 	}
 
 	if (!options.projectEntityId && !options.projectName) {

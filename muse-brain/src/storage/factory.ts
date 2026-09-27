@@ -13,14 +13,14 @@ export function createStorage(config: StorageConfig, tenant: string): IBrainStor
 		if (!config.databaseUrl) {
 			throw new Error("createStorage: databaseUrl is required for postgres backend");
 		}
-		return createPostgresStorage(config.databaseUrl, tenant);
+		return createPostgresStorage(config.databaseUrl, tenant, config.prepare, config.allowedTenants);
 	}
 
 	if (config.backend === "sqlite") {
 		if (!config.sqlitePath) {
 			throw new Error("createStorage: sqlitePath is required for sqlite backend");
 		}
-		return createSQLiteStorage(config.sqlitePath, tenant);
+		return createSQLiteStorage(config.sqlitePath, tenant, config.allowedTenants);
 	}
 
 	throw new Error(`createStorage: unknown backend: ${String((config as any).backend)}`);

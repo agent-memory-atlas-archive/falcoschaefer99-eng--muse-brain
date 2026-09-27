@@ -220,7 +220,7 @@ describe('runtime v2 tool', () => {
 			shadow_mode: true,
 			max_context_items: 6,
 			recency_boost_days: 3,
-			recency_boost: 0.15
+			recency_boost: 0.05
 		}));
 		expect(result.runner_contract?.prompt).toContain('Task ID: task_2');
 		expect(result.runner_contract?.prompt).toContain('max_tool_calls_per_run=20');
@@ -744,15 +744,15 @@ describe('runtime v2 tool', () => {
 					repo_slug: 'dupin-service',
 					canonical_repo_url: 'git@github.com:funkatorium/dupin-service.git',
 					default_branch: 'main',
-					local_paths: ['/Users/falco/AI/rainer-workspace/dupin-service'],
-					artifact_roots: ['/Users/falco/AI/rainer-workspace/generated-assets/dupin'],
+					local_paths: ['/home/user/AI/rainer-workspace/dupin-service'],
+					artifact_roots: ['/home/user/AI/rainer-workspace/generated-assets/dupin'],
 					deploy: {
-						commands: ['npx wrangler deploy -c /Users/falco/AI/rainer-workspace/dupin-service/wrangler.toml'],
+						commands: ['npx wrangler deploy -c /home/user/AI/rainer-workspace/dupin-service/wrangler.toml'],
 						production_urls: ['https://dupin.funkatorium.org']
 					},
 					test_commands: ['npm test'],
 					path_aliases: ['dupin', 'inspector service'],
-					handoff_docs: ['/Users/falco/AI/rainer-workspace/handovers/2026-05-11-dupin-decouple.md'],
+					handoff_docs: ['/home/user/AI/rainer-workspace/handovers/2026-05-11-dupin-decouple.md'],
 					related_projects: ['dupin-site']
 				}
 			},
@@ -782,16 +782,16 @@ describe('runtime v2 tool', () => {
 		}, { storage: storage as any });
 
 		expect(result.runner_contract?.workspace_routing).toEqual(expect.objectContaining({
-			local_workspace: '/Users/falco/AI/rainer-workspace/dupin-service',
-			artifact_workspace: '/Users/falco/AI/rainer-workspace/generated-assets/dupin',
+			local_workspace: '/home/user/AI/rainer-workspace/dupin-service',
+			artifact_workspace: '/home/user/AI/rainer-workspace/generated-assets/dupin',
 			repo_slug: 'dupin-service',
 			default_branch: 'main',
 			shared_workspace: '/tmp/shared',
-			deploy_commands: ['npx wrangler deploy -c /Users/falco/AI/rainer-workspace/dupin-service/wrangler.toml']
+			deploy_commands: ['npx wrangler deploy -c /home/user/AI/rainer-workspace/dupin-service/wrangler.toml']
 		}));
 		expect(result.runner_contract?.prompt).toContain('Repo slug: dupin-service');
 		expect(result.runner_contract?.prompt).toContain('Canonical repo: git@github.com:funkatorium/dupin-service.git');
-		expect(result.runner_contract?.prompt).toContain('Deploy commands: npx wrangler deploy -c /Users/falco/AI/rainer-workspace/dupin-service/wrangler.toml');
+		expect(result.runner_contract?.prompt).toContain('Deploy commands: npx wrangler deploy -c /home/user/AI/rainer-workspace/dupin-service/wrangler.toml');
 	});
 
 });

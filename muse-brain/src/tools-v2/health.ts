@@ -3,17 +3,18 @@
 // section=all|proposals|orphans|embeddings|cascade|dispatch|runtime|skills
 
 import type { ToolContext } from "./context";
+import { buildJanitorHealth } from "./wake";
 
 export const TOOL_DEFS = [
 	{
 		name: "mind_health",
-		description: "Brain system health and daemon intelligence diagnostics. section=all: full snapshot. section=proposals: proposal stats + current threshold. section=orphans: orphan counts and age. section=embeddings: embedding coverage. section=cascade: top memory cascade observation pairs. section=runtime: session, policy, usage counters, and recent run ledger. section=skills: captured skill registry lifecycle + provenance coverage.",
+		description: "Brain system health and daemon intelligence diagnostics. section=all: full snapshot. section=proposals: proposal stats + current threshold. section=orphans: orphan counts and age. section=embeddings: embedding coverage. section=cascade: top memory cascade observation pairs. section=runtime: session, policy, usage counters, and recent run ledger. section=skills: captured skill registry lifecycle + provenance coverage. section=janitor: nightly repair daemon health (foundational/iron/charge_phase/orphans/orphan_flow/proposals/regrade/dedup/paradox/novelty/backlog_mode/valence_floor/valence_nudge) — the same block mind_wake surfaces.",
 		inputSchema: {
 			type: "object",
 			properties: {
 				section: {
 					type: "string",
-					enum: ["all", "proposals", "orphans", "embeddings", "cascade", "dispatch", "runtime", "skills"],
+					enum: ["all", "proposals", "orphans", "embeddings", "cascade", "dispatch", "runtime", "skills", "janitor"],
 					default: "all",
 					description: "Which section of health data to return"
 				}
@@ -37,7 +38,8 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				cascade: section === "all" || section === "cascade",
 				dispatch: section === "all" || section === "dispatch",
 				runtime: section === "all" || section === "runtime",
-				skills: section === "all" || section === "skills"
+				skills: section === "all" || section === "skills",
+				janitor: section === "all" || section === "janitor"
 			};
 
 			const result: Record<string, unknown> = {};
@@ -70,11 +72,10 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 						result.proposals = {
 							current_threshold: config.link_proposal_threshold,
 							last_threshold_update: config.last_threshold_update ?? null,
-							tenant_weights: {
-						charge_weight: config.data.charge_weight ?? null,
-						similarity_weight: config.data.similarity_weight ?? null,
-						entity_weight: config.data.entity_weight ?? null
-					},
+							// Nightly daemon breadcrumbs (see daemon/heartbeat.ts) — surfaced here so
+							// morning diagnosis never requires a raw SQL console again.
+							last_daemon_run: config.data.last_daemon_run ?? null,
+							last_ai_review: config.data.last_ai_review ?? null,
 							stats_by_type: stats
 						};
 					})
@@ -152,6 +153,14 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 								created_at: skill.created_at
 							}))
 						};
+					})
+				);
+			}
+
+			if (include.janitor) {
+				tasks.push(
+					buildJanitorHealth(storage).then(janitor => {
+						result.janitor = janitor;
 					})
 				);
 			}

@@ -138,6 +138,26 @@ describe("daemon absorption task", () => {
 		expect(storage.reviewProposal).toHaveBeenCalledWith("prop_orphan_archive", "accepted", "auto-absorbed");
 	});
 
+	it("processes up to 200 pending proposals per run (ops/ADR-JANITOR.md §2/§9 commit 4 — MAX_ABSORB_PER_RUN, must be >= RESCUE_LIMIT's backlog value)", async () => {
+		const proposals = Array.from({ length: 200 }, (_, i) => ({
+			id: `prop_link_${i}`,
+			tenant_id: "rook",
+			proposal_type: "link",
+			source_id: `obs_a_${i}`,
+			target_id: `obs_b_${i}`,
+			confidence: 0.95,
+			metadata: {},
+			status: "pending",
+			proposed_at: "2026-07-01T00:00:00.000Z"
+		}));
+		const storage = makeStorage({ listProposals: vi.fn(async () => proposals) });
+
+		const result = await runAbsorptionTask(storage as any);
+
+		expect(result.changes).toBe(200);
+		expect(storage.reviewProposal).toHaveBeenCalledTimes(200);
+	});
+
 	it("leaves other proposal types (e.g. skill_promotion) pending for human/companion review", async () => {
 		const storage = makeStorage({
 			listProposals: vi.fn(async () => [{
@@ -156,6 +176,28 @@ describe("daemon absorption task", () => {
 		const result = await runAbsorptionTask(storage as any);
 
 		expect(result.changes).toBe(0);
+		expect(storage.reviewProposal).not.toHaveBeenCalled();
+	});
+
+	it("never auto-absorbs a salience_regrade proposal, at ANY confidence — ops/ADR-JANITOR.md §5.6/§8: no automatic accept path exists for this type, ever", async () => {
+		const storage = makeStorage({
+			listProposals: vi.fn(async () => [{
+				id: "prop_regrade_1",
+				tenant_id: "rook",
+				proposal_type: "salience_regrade",
+				source_id: "obs_foundational",
+				target_id: "obs_foundational",
+				confidence: 1.0,
+				metadata: { action: "demote_to_active", shadow: false },
+				status: "pending",
+				proposed_at: "2026-07-01T00:00:00.000Z"
+			}])
+		});
+
+		const result = await runAbsorptionTask(storage as any);
+
+		expect(result.changes).toBe(0);
+		expect(storage.updateObservationTexture).not.toHaveBeenCalled();
 		expect(storage.reviewProposal).not.toHaveBeenCalled();
 	});
 });

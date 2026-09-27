@@ -1,6 +1,6 @@
 {
 	"name": "muse-brain",
-	"version": "1.10.0",
+	"version": "1.11.0",
 	"description": "Relational memory substrate for AI agents with MCP tools, identity continuity, and self-hosted persistence.",
 	"keywords": [
 		"mcp",
@@ -27,6 +27,7 @@
 	"license": "CC-BY-NC-SA-4.0",
 	"author": "Falco Schäfer / The Funkatorium",
 	"scripts": {
+		"predeploy": "tsc --noEmit -p tsconfig.json && vitest -c vitest.unit.config.mts --run",
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
@@ -36,6 +37,8 @@
 		"test:reliability": "npm run test:contracts",
 		"test:workers": "vitest",
 		"agent-memory:sync": "node scripts/agent-memory-sync.mjs",
+		"assemble-public-release": "node ../ops/assemble-public-release.mjs",
+		"verify-public-release": "node ../ops/verify-public-release.mjs",
 		"cf-typegen": "wrangler types",
 		"benchmark:retrieval": "tsc -p benchmarks/tsconfig.json && node .bench-dist/benchmarks/run.js",
 		"benchmark:cognitive-lane": "node benchmarks/scripts/cognitive-lane.mjs",

@@ -15,6 +15,10 @@ import {
 	CONFIDENCE_DEFAULTS
 } from "./confidence-utils";
 
+// `score` / `confidence` on results below are fused rank scores (RRF over lane
+// positions, ADR-RETRIEVAL-FUSION-RETUNE §1) — a 0-1 band where 1.0 means "rank 1
+// in every matching lane", not an absolute similarity reading. Compare candidates
+// within one response, not against a fixed number from memory.
 export const TOOL_DEFS = [
 	{
 		name: "mind_search",
@@ -30,8 +34,9 @@ export const TOOL_DEFS = [
 				confidence_threshold: { type: "number", description: "Optional confidence gate (0.0-1.0) before returning context rows" },
 				shadow_mode: { type: "boolean", default: false, description: "If true, report threshold effects without dropping rows" },
 				recency_boost_days: { type: "number", description: "Recency boost window in days (default 3)" },
-				recency_boost: { type: "number", description: "Confidence boost for recent rows (0.0-0.5, default 0.15)" },
-				max_context_items: { type: "number", description: "Hard cap for returned context rows after filtering (default uses limit, max 20)" }
+				recency_boost: { type: "number", description: "Confidence boost for recent rows (0.0-0.5, default 0.05)" },
+				max_context_items: { type: "number", description: "Hard cap for returned context rows after filtering (default uses limit, max 20)" },
+				side_effects: { type: "boolean", default: true, description: "Set false for automated/diagnostic callers (the Surfacer, benchmarks) so the search leaves no surfacing footprint — no surface_count / last_accessed / cascade writes" }
 			},
 			required: ["query"]
 		}
@@ -55,6 +60,13 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				return { error: "shadow_mode must be a boolean" };
 			}
 			const shadowMode = args.shadow_mode === true;
+			if (args.side_effects !== undefined && typeof args.side_effects !== "boolean") {
+				return { error: "side_effects must be a boolean" };
+			}
+			// ADR-RETRIEVAL-FUSION-RETUNE §4 "Hard prerequisite" — always-surfacing callers
+			// (the Surfacer) close a gain loop into Layer B via surface_count/last_accessed.
+			// Diagnostic/automated callers pass side_effects:false to leave no footprint.
+			const sideEffects = args.side_effects !== false;
 			const parsedRecencyBoostDays = parseOptionalPositiveInt(args.recency_boost_days, 1, 30);
 			if (args.recency_boost_days !== undefined && parsedRecencyBoostDays === undefined) {
 				return { error: "recency_boost_days must be an integer between 1 and 30" };
@@ -83,8 +95,8 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 			let embedding: number[] | undefined;
 			if (context.ai) {
 				try {
-					const provider = createEmbeddingProvider(context.ai);
-					embedding = await provider.embedText(query);
+					const provider = createEmbeddingProvider(context.ai, { embedQueryPrefix: context.embedQueryPrefix });
+					embedding = await provider.embedQuery(query);
 				} catch (err) {
 					// Embedding failure is non-fatal — fall back to keyword-only.
 					console.error("mind_search embed failed:", err instanceof Error ? err.message : "unknown error");
@@ -121,7 +133,7 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				confidenceScored, confidenceThreshold, shadowMode, maxContextItems
 			);
 
-			if (finalResults.length > 0) {
+			if (finalResults.length > 0 && sideEffects) {
 				fireAndForgetSideEffects(context, finalResults.map(r => r.observation.id), "hybridSearch");
 			}
 
@@ -148,7 +160,8 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 					recency_boost: recencyBoost,
 					below_threshold: belowThresholdCount,
 					pre_cap_count: preCapCount,
-					max_context_items: maxContextItems
+					max_context_items: maxContextItems,
+					side_effects: sideEffects
 				},
 				results: mappedResults,
 				total_matches: mappedResults.length,

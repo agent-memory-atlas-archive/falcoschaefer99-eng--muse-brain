@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+	DEFAULT_TENANT_ALIASES,
 	grantedTenantsFor,
 	isKnownTenant,
 	resolveAllowedTenants,
@@ -33,9 +34,20 @@ describe('tenant-config: env-driven tenant vocabulary', () => {
 	});
 
 	describe('resolveTenantAliases / resolveTenantAlias', () => {
-		it('defaults to no aliases', () => {
-			expect(resolveTenantAliases({} as Env)).toEqual({});
-			expect(resolveTenantAlias({} as Env, 'rook')).toBe('rook');
+		it('defaults to the compiled-in alias map (rook → companion preserved for live clients)', () => {
+			expect(resolveTenantAliases({} as Env)).toEqual(DEFAULT_TENANT_ALIASES);
+			expect(resolveTenantAlias({} as Env, 'rook')).toBe('companion');
+		});
+
+		it('an explicit TENANT_ALIASES env replaces the compiled-in default entirely', () => {
+			const env = { TENANT_ALIASES: 'muse:rainer' } as unknown as Env;
+			expect(resolveTenantAliases(env)).toEqual({ muse: 'rainer' });
+			// The built-in rook alias is retired when the operator supplies their own map.
+			expect(resolveTenantAlias(env, 'rook')).toBe('rook');
+		});
+
+		it('falls back to the compiled-in default when the override is unparsable', () => {
+			expect(resolveTenantAliases({ TENANT_ALIASES: ' , : ,' } as unknown as Env)).toEqual(DEFAULT_TENANT_ALIASES);
 		});
 
 		it('parses ALIAS:CANONICAL pairs and resolves through them', () => {
@@ -44,9 +56,38 @@ describe('tenant-config: env-driven tenant vocabulary', () => {
 			expect(resolveTenantAlias(env, 'rook')).toBe('companion');
 		});
 
-		it('passes unknown values through unchanged', () => {
+		it('passes unknown values through (lowercased)', () => {
 			const env = { TENANT_ALIASES: 'rook:companion' } as unknown as Env;
 			expect(resolveTenantAlias(env, 'rainer')).toBe('rainer');
+			expect(resolveTenantAlias(env, 'stranger')).toBe('stranger');
+		});
+
+		it('never alias-redirects a name that is itself an allowed tenant (production: ALLOWED_TENANTS="rook,rainer")', () => {
+			// The rook-brain production worker: DB stores tenant_id='rook', allowlist is
+			// overridden, TENANT_ALIASES is unset. The default rook → companion alias must
+			// NOT shadow the real configured tenant — that would 400 every 'rook' request.
+			const env = { ALLOWED_TENANTS: 'rook,rainer' } as unknown as Env;
+			expect(resolveTenantAlias(env, 'rook')).toBe('rook');
+			expect(resolveTenantAlias(env, 'Rook')).toBe('rook');
+		});
+
+		it('keeps the rook → companion convenience on the default allowlist (fresh self-hoster)', () => {
+			// Default allowlist is ["companion","rainer"] — 'rook' is not in it, so the
+			// compiled-in alias still applies.
+			expect(resolveTenantAlias({} as Env, 'rook')).toBe('companion');
+		});
+
+		it('allowlist beats even an explicit TENANT_ALIASES entry', () => {
+			const env = { ALLOWED_TENANTS: 'rook,rainer', TENANT_ALIASES: 'rook:companion' } as unknown as Env;
+			expect(resolveTenantAlias(env, 'rook')).toBe('rook');
+		});
+
+		it('normalizes case and whitespace before alias lookup — "Rook" ≡ "rook"', () => {
+			// Reeve #3 / Michael cosmetic: the letter path lowercased, the HTTP path did
+			// not, so header "Rook" 400ed while letter "Rook" worked. One semantic now.
+			expect(resolveTenantAlias({} as Env, 'Rook')).toBe('companion');
+			expect(resolveTenantAlias({} as Env, ' ROOK ')).toBe('companion');
+			expect(resolveTenantAlias({} as Env, 'Rainer')).toBe('rainer');
 		});
 
 		it('parses multiple pairs', () => {

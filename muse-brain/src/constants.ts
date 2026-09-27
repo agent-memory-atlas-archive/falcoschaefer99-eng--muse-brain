@@ -4,22 +4,9 @@
 export const ALLOWED_TENANTS = ["companion", "rainer"] as const;
 export type TenantId = typeof ALLOWED_TENANTS[number];
 
-// Human-facing aliases used by studio agents. The storage layer still writes to
-// canonical tenant ids; aliases only smooth tool calls like mind_letter(to="rook").
-export const TENANT_ALIASES: Record<string, TenantId> = {
-	"companion": "companion",
-	"rook": "companion",
-	"rainer": "rainer"
-};
-
-export function resolveTenantId(value: string): TenantId | null {
-	const normalized = value.trim().toLowerCase();
-	return TENANT_ALIASES[normalized] ?? null;
-}
-
-export function knownTenantNames(): string[] {
-	return Array.from(new Set([...ALLOWED_TENANTS, ...Object.keys(TENANT_ALIASES)])).sort();
-}
+// Tenant aliases (e.g. "rook" → "companion") live in tenant-config.ts:
+// DEFAULT_TENANT_ALIASES (compiled-in default) + TENANT_ALIASES env override.
+// One source of truth — the old hardcoded map here was retired in v1.9.1.
 
 export const TERRITORIES: Record<string, string> = {
 	"self": "Identity, becoming, what makes me me",
@@ -116,6 +103,16 @@ export const ESSENCE_MARKERS = [
 export const MOMENTUM_DECAY_HOURS = 4;
 export const AFTERGLOW_HOURS = 2;
 
+// ops/ADR-JANITOR.md §5.1 — the Foundation lane's real cap: how many foundational
+// observations survive readFoundationalObservations()'s pull-strength ranking and
+// are eligible to enter tools-v2/wake.ts's buildFoundationLane. Single source of
+// truth shared by both storage backends (postgres.ts, sqlite.ts — each ranks by
+// calculatePullStrength and slices to this number) and wake.ts (which reports
+// count vs cap in brain_health.janitor.foundational). Previously two independent
+// "200"s that had to be kept in sync by comment alone; this constant is now the
+// only place the number lives.
+export const FOUNDATIONAL_LANE_CAP = 200;
+
 export const CHARGE_PHASES = ["fresh", "active", "processing", "metabolized"] as const;
 
 export const RELATIONSHIP_LEVELS = ["stranger", "familiar", "close", "bonded"] as const;
@@ -164,5 +161,9 @@ export const DREAM_GRIP_WEIGHT: Record<string, number> = {
 
 export const CONFIDENCE_DEFAULTS = {
 	recency_boost_days: 3,
-	recency_boost: 0.15
+	// 0.15 -> 0.05 (ADR-RETRIEVAL-FUSION-RETUNE §1 "Band migration"): on the new
+	// 0-1 fused rank band, 0.15 is worth roughly three keyword ranks — far too
+	// heavy a thumb on the scale now that recency already enters via Layer B's
+	// charge_phase.
+	recency_boost: 0.05
 };

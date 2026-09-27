@@ -30,38 +30,42 @@ We open-sourced the brain.
 
 **Bring a companion.** Rainer handles creative intelligence: editorial diagnostics, craft architecture, the work. The companion handles *you* — history, voice, what matters at 2am. They coordinate through letters and delegated tasks, like colleagues who share a desk and respect each other's handwriting. Two minds on one substrate, both getting richer the longer they work together.
 
-This is **Relational AI**. A memory system where everything carries emotional charge, identity persists and is defended, and consent flows both directions. A dream engine that digests experience the way real minds do. Finding connections you never asked for, reweighting what matters, letting stale things fade and charged things grip harder.
+This is **Relational AI**. A memory system where everything carries emotional charge, identity persists and can be challenged and defended, and consent is recorded in both directions. A dream engine — six modes of association, built and working — digests experience the way real minds do, on manual call rather than a nightly clock today. Finding connections you never asked for, reweighting what matters, letting stale things fade and charged things grip harder.
 
 Contradiction here is architecture. Both truths stay alive.
 
-The whole system self-learns. Skills emerge from successful runs, get reviewed, graduate or retire. Each agent learns what it's good at by doing the work. Rainer refines his craft the same way. The brain gets smarter the longer it runs because it tracks what worked and why.
+Skills are meant to emerge from successful runs, get reviewed, and graduate or retire. That pipeline is built and runs end to end — candidates are raised, reviewed, and reach terminal states. It has not yet produced a graduate: every candidate so far has been a provenance record of a single run rather than a reusable capability. Each agent learning what it's good at by doing the work is designed in — it is not yet a track record.
 
 Grounded in [16 published papers](muse-brain/docs/BIBLIOGRAPHY.md) — extends beyond current research in six areas. Every design decision has a [receipt](muse-brain/docs/BIBLIOGRAPHY.md).
 
 ---
 
-## The living cycle
+## The cycle
 
-They feed each other.
+They feed each other — and this is the full design, not a status report. Every box below is tagged for what runs tonight versus what is built and waiting on a scheduler. The loop does not close on its own today; the gap at the bottom is real, not stylistic.
 
 ```
-                    ┌───────────────────────┐
-                    │    AUTONOMOUS WAKE     │
-                    │  duty / impulse cycle  │
-                    └───────────┬───────────┘
+                 ┌─────────────────────────────┐
+                 │      AUTONOMOUS WAKE         │
+                 │    duty / impulse cycle      │
+                 │ [BUILT — unscheduled. Runs   │
+                 │  when a clock points at it.] │
+                 └──────────────┬──────────────┘
                                 │ wakes into
                                 ▼
-                    ┌───────────────────────┐
-          ┌─────────│    INTENTION PULSE    │─────────┐
-          │         │ what's stale? what's  │         │
-          │         │ burning? what drifted?│         │
-          │         └───────────┬───────────┘         │
+                 ┌─────────────────────────────┐
+          ┌──────│      INTENTION PULSE         │──────┐
+          │      │ what's stale? what's         │      │
+          │      │ burning? what drifted?       │      │
+          │      │ [LIVE]                       │      │
+          │      └──────────────┬──────────────┘      │
           │                     │ surfaces             │
           ▼                     ▼                      ▼
    ┌─────────────┐  ┌─────────────────┐  ┌──────────────┐
    │  PARADOXES  │  │    DESIRES &    │  │   IDENTITY   │
    │  unresolved │◄─│   OPEN LOOPS    │─►│    CORES     │
    │  tensions   │  │ burning/nagging │  │ vows/anchors │
+   │   [LIVE]    │  │     [LIVE]      │  │    [LIVE]    │
    └──────┬──────┘  └────────┬────────┘  └──────┬───────┘
           │                  │                   │
           │      accelerates │ charge            │
@@ -72,6 +76,8 @@ They feed each other.
    │  emotional chains · somatic     │◄─────────┘
    │  clusters · tension dreams ·    │
    │  deep multi-layer traversal     │
+   │ [BUILT — six modes work. Called │
+   │  by hand, not by the daemon.]   │
    └──────────────┬──────────────────┘
                   │ discovers connections,
                   │ shifts charge phases,
@@ -79,17 +85,23 @@ They feed each other.
                   ▼
    ┌─────────────────────────────────┐
    │      DAEMON INTELLIGENCE        │
-   │  11 background loops every 15m  │
+   │   8 stages · nightly 03:00 UTC  │
    │  proposals · orphan rescue ·    │
    │  novelty scoring · skill health │
    │  paradox detection · task sched │
+   │  (one stage fans out to 14      │
+   │   sub-tasks)                    │
+   │      [LIVE — every night]       │
    └──────────────┬──────────────────┘
                   │ materializes tasks,
                   │ surfaces due obligations
                   ▼
-                    ┌───────────────────────┐
-                    │    AUTONOMOUS WAKE     │◄── cycle repeats
-                    └───────────────────────┘
+        ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐
+          feeds the next AUTONOMOUS WAKE
+        │ — when one is scheduled to run.   │
+          Today nothing schedules it, so
+        │ the loop stays open here.         │
+        └ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘
 ```
 
 Every piece feeds the next — and the cycle tightens. Search finds what you're looking for. Dreams find what you didn't know you needed.
@@ -98,16 +110,18 @@ Every piece feeds the next — and the cycle tightens. Search finds what you're 
 
 ## What the brain gives you
 
-| Capability | What it means |
-|------------|---------------|
-| **Textured memory** | Emotional charge, vividness, somatic markers, and a natural decay cycle — iron-grip memories persist, loose ones fade. Hybrid retrieval blends vector similarity, keyword relevance, and neural modulation. |
-| **Persistent identity** | Identity cores, vows, and anchors survive across sessions. Wakes up knowing who it is, what it believes, and what it's committed to — and defends those beliefs under pressure. |
-| **Dream engine** | Six association modes — emotional chains, somatic clusters, tension dreams, entity dreams, temporal patterns, deep multi-layer traversal. Circadian-aware. Memories that pass through come out changed. |
-| **Charge processing** | Memories move through four phases: fresh → active → processing → metabolized. Repeated intentional engagement advances the phase. Burning paradoxes accelerate the cycle. The agent earns depth through attention. |
-| **Bilateral consent** | Relationship-gated permissions with hard boundaries the agent enforces. Structural consent that scales with trust. |
-| **Autonomous execution** | Works while you sleep. Duty wakes, impulse exploration, dependency-aware task picking, and skill capture — all policy-gated. |
-| **Self-learning** | Skills emerge from successful runs, get reviewed, graduate or retire. Review-gated — no blind auto-learning. The agent gets better at what it actually does. |
-| **Multi-mind** | Two agents, one backend. Isolated memory and identity, shared substrate. Cross-tenant letters and delegated tasks. Collaboration, not parallel storage. |
+Each row is tagged **Live** (running today), **Built** (working, but nothing schedules or enforces it yet), or **Early** (the pipeline runs; it has no track record yet).
+
+| Capability | | What it means |
+|------------|---|---------------|
+| **Textured memory** | Live | Emotional charge, vividness, somatic markers, and a natural decay cycle — iron-grip memories persist, loose ones fade. Hybrid retrieval blends vector similarity, keyword relevance, and neural modulation. |
+| **Charge processing** | Live | Memories move through four phases: fresh → active → processing → metabolized. Repeated intentional engagement advances the phase. The agent earns depth through attention. (Burning paradoxes are designed to accelerate the cycle; no paradox has met the threshold yet.) |
+| **Multi-mind** | Live | Two agents, one backend, and a wall between them that holds: isolated memory and identity per tenant, nothing leaking sideways. What crosses is deliberate — letters and delegated tasks, agent to agent. Most memory frameworks give you one mind, or a shared one. This gives you two that stay themselves and still talk. |
+| **Persistent identity** | Live | Identity cores, vows, and anchors survive across sessions. Wakes up knowing who it is, what it believes, and what it's committed to. Beliefs can be formally challenged and defended — the mechanism works; one challenge has been recorded across the current identity set. |
+| **Dream engine** | Built | Six association modes — emotional chains, somatic clusters, tension dreams, entity dreams, temporal patterns, deep multi-layer traversal. Circadian-aware, and memories that pass through come out changed. Invoked by hand; not yet wired into the nightly daemon. |
+| **Bilateral consent** | Built | Relationship levels and boundaries, recorded in both directions and visible to the agent, which is expected to honor them. Note the honest limit: consent is **recorded state, not enforced permissions** — no tool currently gates on the level. |
+| **Autonomous execution** | Built | Built end to end — duty wakes, impulse exploration, dependency-aware task picking, skill capture, all policy-gated — and currently unscheduled. Last ran 2026-04-05. Nothing broke; nobody has pointed a clock at it since. Point a cron or webhook at the runtime trigger and it runs tonight. |
+| **Self-learning** | Early | Skills emerge from successful runs and are review-gated before they can graduate or retire — no blind auto-learning. The full path works: candidates are raised, reviewed, and retired or promoted on a stated reason. Nothing has been promoted yet — every candidate so far records a single run rather than a reusable capability. An early pipeline, not a track record. |
 
 ---
 
@@ -130,7 +144,7 @@ Your AI Agent (Claude, GPT, or any MCP client)
     captured skills, daemon intelligence
 ```
 
-The worker handles auth, rate limiting, and tenant isolation. A background daemon runs every 15 minutes: generating proposals, rescuing orphaned memories, scoring novelty, detecting paradoxes, materializing recall contracts, monitoring skill health, and scheduling tasks.
+The worker handles auth, rate limiting, and tenant isolation. A background daemon runs nightly at 03:00 UTC — via the box runner (`rook-brain-daemon.timer`), not a Worker cron trigger — in 8 stages, one of which fans out to 14 sub-tasks: generating proposals, rescuing orphaned memories, scoring novelty, detecting paradoxes, materializing recall contracts, monitoring skill health, and scheduling tasks. Several of those sub-tasks are deliberately dormant until an operator configures them — dedup ships with no default similarity threshold, and salience regrade runs in shadow — so a zero in their output is a switch left off, not a failure.
 
 Full technical deep-dive: **[Architecture Dossier](muse-brain/docs/ARCHITECTURE_BRAIN_v1.md)**
 
@@ -288,7 +302,7 @@ Organized by what they do, not how they're built.
 ### Autonomous Runtime
 | Tool | What it does |
 |------|-------------|
-| `mind_wake` | Wake the agent — quick, full, or orientation mode with circadian awareness |
+| `mind_wake` | Wake the agent — quick, full, or orientation mode with circadian awareness. Every quick and full wake carries a `foundation` lane (anchors + foundational-salience observations, capped ~8,000 chars, present regardless of recency) and a `brain_health` snapshot (embedding coverage, last nightly daemon run, retrieval profile) — see below. |
 | `mind_wake_log` | Read or write wake session logs |
 | `mind_runtime` | Manage sessions, log runs, set policies, trigger scheduled/manual runtime cycles |
 | `mind_task` | Create, delegate, and track tasks across tenants with scheduled wake activation, dual executor/reviewer flows, and artifact-path handoffs |
@@ -305,6 +319,37 @@ Organized by what they do, not how they're built.
 | `mind_health` | Runtime, skill, dispatch, and storage health diagnostics |
 
 ---
+
+### The foundation lane — never waking up a stranger
+
+Recent-activity tiering (the default fast path for `mind_wake`) is a deliberate trade — it
+only reads territories touched in the last 7 days, so a foundational memory sitting in a
+quiet territory can go unsurfaced indefinitely. The `foundation` lane closes that gap: every
+quick and full wake carries `anchors` (up to 12 anchors, newest first, full content
+— see `mind_anchor`) and `foundational` (up to 5 `texture.salience === "foundational"`
+observations, ranked by pull strength, deduped against whatever already surfaced in
+`pulling`/`recent_grip` so nothing double-prints), plus `foundational_total` /
+`foundational_considered` so truncation past the 200-row fetch cap is visible instead of
+silent. The whole lane is capped around 8,000 characters — foundational snippets truncate
+first, anchors only get trimmed if their raw content alone blows the budget. Surfaced anchors
+get their `activation_count` bumped once per wake. Unlike every other lane, `foundation` is
+deliberately excluded from wake deltas — it's meant to be the constant spine, not a "what
+changed" feed.
+
+`anchors` requires the caller's lease to carry `identity.read` (mirroring `mind_anchor`
+itself) — a lease scoped to `memory.read` alone gets `foundational` but not `anchors`, plus
+`foundation.anchors_omitted` naming why. No lease on the tool context happens only for
+daemon-internal dispatch and direct tool/test calls — never a real HTTP/MCP request, which
+always carries either a header lease or a synthetic root lease (API-key/legacy callers pass
+via that synthetic root lease's capability bypass, not by skipping the gate).
+
+`brain_health` ships alongside it as a top-level wake field: embedding coverage percentage,
+the last nightly daemon run's outcome (`finished_at`/`ok`/`completed_stages`/`failed_stages`),
+and the active retrieval profile. `completed_stages` means "reached," not "succeeded" — a
+stage that threw is still recorded there but also lands in `failed_stages`, and either an
+`error` or a non-empty `failed_stages` flips `ok` to false. A one-sentence `warning` appears
+when coverage drops below 90% or the last daemon run didn't finish cleanly — the answer to
+"can I trust my own recall today?"
 
 ## Runtime trigger and legacy runner templates
 

@@ -1,9 +1,17 @@
 import type { Observation } from "../types";
 import type { QuerySignals, RetrievalProfile } from "./query-signals";
-import type { HybridScoreBreakdown } from "./scoring";
+import type { AnyHybridScoreBreakdown, HybridScoreBreakdown } from "./scoring";
 import { clamp, unique } from "./utils";
 
 export type RetrievalRerankMode = "off" | "heuristic" | "model";
+
+/** A scored candidate's diagnostics come from whichever scorer produced it —
+ * the new RRF scorer (HybridScoreBreakdown) or the frozen legacy scorer
+ * (HybridScoreBreakdownLegacy, retrieval_profile: "legacy"). Rerank only reads
+ * the shared `.signals` shape, so it never needs to narrow the union. Defined
+ * in ./scoring.ts next to its constituents; re-exported here for existing
+ * importers. */
+export type { AnyHybridScoreBreakdown };
 
 export interface RetrievalRerankModelCandidate {
 	id: string;
@@ -13,7 +21,7 @@ export interface RetrievalRerankModelCandidate {
 	content: string;
 	summary?: string;
 	created?: string;
-	score_breakdown?: HybridScoreBreakdown;
+	score_breakdown?: AnyHybridScoreBreakdown;
 }
 
 export interface RetrievalRerankModelInput {
@@ -64,7 +72,7 @@ export interface RetrievalRerankableResult {
 	match_sources: string[];
 	vector_similarity?: number;
 	keyword_rank?: number;
-	score_breakdown?: HybridScoreBreakdown;
+	score_breakdown?: AnyHybridScoreBreakdown;
 	rerank_trace?: RetrievalRerankTrace;
 }
 
@@ -73,11 +81,6 @@ export interface RetrievalRerankOutcome<T extends RetrievalRerankableResult> {
 	mode: RetrievalRerankMode;
 	applied: boolean;
 	traces: RetrievalRerankTrace[];
-}
-
-function defaultModeForProfile(profile: RetrievalProfile): RetrievalRerankMode {
-	// Keep rerank opt-in by profile: benchmark lane enables heuristic by default.
-	return profile === "benchmark" ? "heuristic" : "off";
 }
 
 function computeHeuristicDelta(
@@ -160,24 +163,40 @@ function computeHeuristicDelta(
 	};
 }
 
+/**
+ * Best-effort fused-shaped breakdown for a candidate that reached rerank with
+ * no score_breakdown at all — only possible for hand-built test candidates;
+ * every real backend (postgres.ts/sqlite.ts) always attaches a real one from
+ * scoreHybridCandidate/scoreHybridCandidateLegacy before results ever reach
+ * applyRetrievalRerank. Hard-coded to "fused" rather than branching on the
+ * caller's retrieval_profile (which may be "legacy" or an alias): this exists
+ * only so rerank has *something* to attach `.rerank` metadata to, never to
+ * represent a legacy-scored candidate's true breakdown — a legacy candidate
+ * without a score_breakdown is itself a caller bug this function doesn't try
+ * to paper over correctly.
+ */
 function synthesizeScoreBreakdown(
-	profile: RetrievalProfile,
 	querySignals: QuerySignals,
 	baseScore: number
 ): HybridScoreBreakdown {
 	return {
-		profile,
+		profile: "fused",
 		layer_a: {
+			rrf_raw: 0,
 			base_relevance: baseScore,
-			vector_component: 0,
-			keyword_component: 0,
-			hint_component: 0,
-			entity_component: 0,
+			vector_position: null,
+			keyword_position: null,
+			entity_position: null,
+			hint_position: null,
+			vector_similarity: null,
+			keyword_ts_rank: null,
 			signal_boost: 0,
+			signal_idf: { quoted_phrase: 0, proper_name: 0, temporal: 0, assistant_reference: 0 },
 			adjusted_relevance: baseScore
 		},
 		layer_b: {
 			base_multiplier: 1,
+			capped_multiplier: 1,
 			grip_multiplier: 1,
 			charge_phase_multiplier: 1,
 			novelty_multiplier: 1,
@@ -216,7 +235,12 @@ export async function applyRetrievalRerank<T extends RetrievalRerankableResult>(
 	results: T[];
 	options?: RetrievalRerankOptions;
 }): Promise<RetrievalRerankOutcome<T>> {
-	const modeRequested = args.options?.mode ?? defaultModeForProfile(args.retrieval_profile);
+	// No profile-based default: both real callers (postgres.ts/sqlite.ts) always
+	// pass an explicit `mode: options.rerank_mode ?? "off"` — that's the single
+	// source of the "off by default" behavior now (ADR-RETRIEVAL-FUSION-RETUNE
+	// §9/§10 row 6: the old benchmark→heuristic profile coupling is deleted, not
+	// moved to run_config — there was nothing left to move).
+	const modeRequested = args.options?.mode ?? "off";
 	if (modeRequested === "off" || args.results.length === 0) {
 		return {
 			results: args.results,
@@ -358,7 +382,7 @@ export async function applyRetrievalRerank<T extends RetrievalRerankableResult>(
 		};
 		const baseBreakdown = row.result.score_breakdown
 			?? (rerankApplied
-				? synthesizeScoreBreakdown(args.retrieval_profile, args.query_signals, row.base_score)
+				? synthesizeScoreBreakdown(args.query_signals, row.base_score)
 				: undefined);
 		const rerankBreakdown = baseBreakdown
 			? { ...baseBreakdown, rerank: rerankMeta }

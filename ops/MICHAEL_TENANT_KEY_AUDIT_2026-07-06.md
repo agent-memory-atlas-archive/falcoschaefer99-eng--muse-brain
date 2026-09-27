@@ -2,13 +2,13 @@
 **Verdict: FAIL — the vault has no lock. There is no key→tenant binding at all. Path B Slice 1 (per-companion brain keys) cannot land until the server derives tenant FROM the key.**
 
 **Files reviewed (this session):**
-- `/Users/falco/AI/muse-brain/muse-brain/src/index.ts` (worker entry, auth, tenant resolution)
-- `/Users/falco/AI/muse-brain/muse-brain/src/constants.ts` (ALLOWED_TENANTS, territories)
-- `/Users/falco/AI/muse-brain/muse-brain/src/types.ts` (Env shape)
-- `/Users/falco/AI/muse-brain/muse-brain/src/storage/factory.ts`, `storage/postgres.ts`, `storage/interface.ts` (tenant scoping)
-- `/Users/falco/AI/muse-brain/muse-brain/src/tools-v2/comms.ts` (mind_letter cross-brain), `runtime.ts`, `memory.ts` (cross-tenant params)
-- `/Users/falco/AI/muse-brain/muse-brain/{.env.example,.dev.vars.example,wrangler.jsonc.example}`
-- `/Users/falco/AI/rook-memory/cloud_brain_proxy.py` (client proxy)
+- `~/AI/muse-brain/muse-brain/src/index.ts` (worker entry, auth, tenant resolution)
+- `~/AI/muse-brain/muse-brain/src/constants.ts` (ALLOWED_TENANTS, territories)
+- `~/AI/muse-brain/muse-brain/src/types.ts` (Env shape)
+- `~/AI/muse-brain/muse-brain/src/storage/factory.ts`, `storage/postgres.ts`, `storage/interface.ts` (tenant scoping)
+- `~/AI/muse-brain/muse-brain/src/tools-v2/comms.ts` (mind_letter cross-brain), `runtime.ts`, `memory.ts` (cross-tenant params)
+- `~/AI/muse-brain/muse-brain/{.env.example,.dev.vars.example,wrangler.jsonc.example}`
+- `~/AI/rook-memory/cloud_brain_proxy.py` (client proxy)
 **Mode:** Deep Review (gating, single UNVERIFIED item closure)
 
 ---

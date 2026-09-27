@@ -1,5 +1,5 @@
 -- ============================================================
--- Brain v5 — Migration 017: Agent House Trust Layer (v1.8)
+-- Brain v5 — Migration 019: Agent House Trust Layer (v1.8)
 -- ============================================================
 
 -- Server-side lease ledger. Clients may present lease envelopes, but the

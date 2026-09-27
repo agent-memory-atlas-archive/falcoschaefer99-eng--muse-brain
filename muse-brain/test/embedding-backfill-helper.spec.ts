@@ -11,6 +11,10 @@ function makeProvider(poisonText: string): IEmbeddingProvider {
 			if (text === poisonText) throw new Error('poison row rejected by embedText');
 			return [1, 2, 3];
 		},
+		async embedQuery(text: string) {
+			if (text === poisonText) throw new Error('poison row rejected by embedText');
+			return [1, 2, 3];
+		},
 		async embedBatch(texts: string[]) {
 			if (texts.includes(poisonText)) throw new Error('batch poisoned');
 			return texts.map(() => [1, 2, 3]);
@@ -42,6 +46,7 @@ describe('embedBackfillBatch', () => {
 			dimensions: 3,
 			modality: 'text',
 			async embedText() { return [1, 2, 3]; },
+			async embedQuery() { return [1, 2, 3]; },
 			async embedBatch(texts: string[]) {
 				batchCalls += 1;
 				return texts.map(() => [1, 2, 3]);
@@ -61,6 +66,7 @@ describe('embedBackfillBatch', () => {
 			dimensions: 3,
 			modality: 'text',
 			async embedText() { throw new Error('always fails'); },
+			async embedQuery() { throw new Error('always fails'); },
 			async embedBatch() { throw new Error('always fails'); }
 		};
 
@@ -77,6 +83,7 @@ describe('embedBackfillBatch', () => {
 			dimensions: 3,
 			modality: 'text',
 			async embedText() { called = true; return [1, 2, 3]; },
+			async embedQuery() { called = true; return [1, 2, 3]; },
 			async embedBatch() { called = true; return []; }
 		};
 

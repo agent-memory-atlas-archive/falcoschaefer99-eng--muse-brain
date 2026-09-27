@@ -48,7 +48,8 @@ import type {
 	CapturedSkillRegistryHealth,
 	AgentLeaseRecord,
 	AgentAuditEvent,
-	AgentAuditEventFilter
+	AgentAuditEventFilter,
+	ChargeValenceRow
 } from "../types";
 
 import {
@@ -56,17 +57,28 @@ import {
 	HARD_BOUNDARIES,
 	RELATIONSHIP_GATES,
 	CIRCADIAN_PHASES,
-	ALLOWED_TENANTS
+	ALLOWED_TENANTS,
+	FOUNDATIONAL_LANE_CAP
 } from "../constants";
+import { EXPIRABLE_PROPOSAL_TYPES } from "../types";
+import { isAllowedTenant, normalizeAllowedTenants } from "./tenant-scope";
 
-import { getTimestamp, calculateMomentumDecay, calculateAfterglowFade, generateId } from "../helpers";
+import { getTimestamp, calculateMomentumDecay, calculateAfterglowFade, generateId, rankFoundationalByPullStrength } from "../helpers";
 import {
 	DEFAULT_RETRIEVAL_PROFILE,
 	getRetrievalProfileConfig,
 	normalizeRetrievalProfile,
-	extractQuerySignals
+	extractQuerySignals,
+	validateProfileOverrides,
+	computeSignalDocumentFrequency
 } from "../retrieval/query-signals";
-import { scoreHybridCandidate } from "../retrieval/scoring";
+import {
+	scoreHybridCandidate,
+	scoreHybridCandidateLegacy,
+	resolveCandidatePoolForProfile,
+	type ScoringPlan,
+	type CandidateSetStats
+} from "../retrieval/scoring";
 import type { RetrievalHintArtifact } from "../retrieval/hints";
 import {
 	buildInitialRetrievalHints,
@@ -74,6 +86,10 @@ import {
 	deriveQueryHintTerms
 } from "../retrieval/hints";
 import { applyRetrievalRerank } from "../retrieval/rerank";
+import { proposalKey } from "./keys";
+import { applyDecaySemantics } from "../daemon/decay";
+import { assertArrivalNotAfterCutoff } from "../daemon/types";
+import type { ArrivalBoundary, StateWindow } from "../daemon/types";
 
 import type {
 	IBrainStorage,
@@ -82,6 +98,8 @@ import type {
 	SimilarResult,
 	HybridSearchOptions,
 	HybridSearchResult,
+	LaneProbeOptions,
+	LaneProbeResult,
 	TextureUpdate
 } from "./interface";
 
@@ -99,7 +117,6 @@ type StoredObservation = Observation & {
 	entity_tags?: string[];
 	processing_count?: number;
 	surface_count?: number;
-	last_surfaced_at?: string;
 	novelty_score?: number;
 };
 
@@ -146,7 +163,8 @@ const KV_KEYS = {
 	agent_audit_events: "agent_audit_events",
 	memory_cascade: "memory_cascade",
 	retrieval_hints: "retrieval_hints",
-	limbic_config: "limbic_config"
+	limbic_config: "limbic_config",
+	charge_valence: "charge_valence"
 } as const;
 
 function deepClone<T>(value: T): T {
@@ -191,6 +209,21 @@ function nowIso(): string {
 	return getTimestamp();
 }
 
+/**
+ * One candidate as it enters a lane pool. Module-scope (not method-local) because
+ * `generateLaneCandidates`, `hybridSearch`, and `probeLanes` all share this shape —
+ * lifted out of hybridSearch so probeLanes can reuse the exact same seed-building
+ * logic instead of a second hand-maintained copy.
+ */
+interface CandidateSeed {
+	obs: StoredObservation;
+	keywordRank: number;
+	vectorSimilarity?: number;
+	hasEntityMatch: boolean;
+	hintScore: number;
+	hintMatchedTypes: string[];
+}
+
 async function initSqlite(path: string): Promise<SqliteDb> {
 	let sqliteModule: any;
 	try {
@@ -226,8 +259,9 @@ export class SQLiteBrainStorage implements IBrainStorage {
 	private readonly tenant: string;
 	private readonly dbPromise: Promise<SqliteDb>;
 
-	constructor(sqlitePath: string, tenant: string, shared?: DbPromises) {
-		if (!ALLOWED_TENANTS.includes(tenant as typeof ALLOWED_TENANTS[number])) {
+	constructor(sqlitePath: string, tenant: string, shared?: DbPromises, allowedTenants: readonly string[] = ALLOWED_TENANTS) {
+		this.allowedTenants = normalizeAllowedTenants(allowedTenants);
+		if (!isAllowedTenant(tenant, this.allowedTenants)) {
 			throw new Error(`Invalid tenant: ${tenant}`);
 		}
 
@@ -241,6 +275,8 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		this.dbPromise = shared?.dbPromise ?? initSqlite(this.sqlitePath);
 	}
 
+	private readonly allowedTenants: readonly string[];
+
 	private async db(): Promise<SqliteDb> {
 		return this.dbPromise;
 	}
@@ -251,10 +287,11 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			entity_tags: _entity_tags,
 			processing_count: _processing_count,
 			surface_count: _surface_count,
-			last_surfaced_at: _last_surfaced_at,
 			novelty_score: _novelty_score,
 			...publicObs
 		} = obs;
+		// last_surfaced_at is a real Observation field (ops/ADR-JANITOR.md §2.1 instance
+		// nine, commit 7c) — it stays in publicObs now, deliberately not destructured out.
 		return publicObs as Observation;
 	}
 
@@ -307,7 +344,11 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		if (!row?.value) return deepClone(fallback);
 		try {
 			return JSON.parse(row.value) as T;
-		} catch {
+		} catch (err) {
+			// A parse failure here (corruption, partial write, truncation) would otherwise
+			// be indistinguishable from "genuinely empty" — log so a future occurrence
+			// leaves a trace instead of silence. Fallback behavior is unchanged.
+			console.error(`readValue: failed to parse stored JSON for key "${key}":`, err instanceof Error ? err.message : err);
 			return deepClone(fallback);
 		}
 	}
@@ -373,11 +414,15 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		return this.tenant;
 	}
 
+	getAllowedTenants(): readonly string[] {
+		return this.allowedTenants;
+	}
+
 	forTenant(tenant: string): IBrainStorage {
-		if (!ALLOWED_TENANTS.includes(tenant as typeof ALLOWED_TENANTS[number])) {
+		if (!isAllowedTenant(tenant, this.allowedTenants)) {
 			throw new Error("Invalid tenant");
 		}
-		return new SQLiteBrainStorage(this.sqlitePath, tenant, { dbPromise: this.dbPromise });
+		return new SQLiteBrainStorage(this.sqlitePath, tenant, { dbPromise: this.dbPromise }, this.allowedTenants);
 	}
 
 	// ============ TERRITORY VALIDATION ============
@@ -505,6 +550,10 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		if (filter.charges_any?.length) rows = rows.filter(o => filter.charges_any!.some(c => o.texture?.charge?.includes(c)));
 		if (filter.created_after) rows = rows.filter(o => toMillis(o.created) >= toMillis(filter.created_after));
 		if (filter.created_before) rows = rows.filter(o => toMillis(o.created) <= toMillis(filter.created_before));
+		if (filter.touched_after) {
+			const touchedAfter = toMillis(filter.touched_after);
+			rows = rows.filter(o => Math.max(toMillis(o.created), toMillis(o.last_accessed)) >= touchedAfter);
+		}
 		if (filter.type) rows = rows.filter(o => o.type === filter.type);
 		if (filter.tags?.length) rows = rows.filter(o => filter.tags!.some(tag => (o.tags ?? []).includes(tag)));
 
@@ -527,6 +576,40 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		});
 
 		return rows.slice(offset, offset + limit).map(o => ({ observation: this.toPublicObservation(o), territory: o.territory }));
+	}
+
+	async readFoundationalObservations(): Promise<{ observation: Observation; territory: string }[]> {
+		const rows = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
+		// ops/ADR-JANITOR.md §5.1 — ranked by calculatePullStrength via the shared
+		// rankFoundationalByPullStrength helper, not recency — parity with postgres.ts's
+		// readFoundationalObservations, which ranks the same way for the same reason
+		// (buildFoundationLane in wake.ts re-ranks by this exact measure; truncating by
+		// recency here first was dropping high-pull-strength old memories before the
+		// ranker ever saw them).
+		const mapped = rows
+			.filter(o => o.texture?.salience === "foundational")
+			.map(o => ({ observation: this.toPublicObservation(o), territory: o.territory }));
+		return rankFoundationalByPullStrength(mapped, FOUNDATIONAL_LANE_CAP);
+	}
+
+	async countFoundationalObservations(): Promise<number> {
+		const rows = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
+		return rows.filter(o => o.texture?.salience === "foundational").length;
+	}
+
+	async countIronObservations(): Promise<number> {
+		const rows = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
+		return rows.filter(o => o.texture?.grip === "iron").length;
+	}
+
+	async getChargePhaseCounts(): Promise<{ fresh: number; active: number; processing: number; metabolized: number }> {
+		const rows = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
+		const counts = { fresh: 0, active: 0, processing: 0, metabolized: 0 };
+		for (const o of rows) {
+			const phase = o.texture?.charge_phase;
+			if (phase && phase in counts) counts[phase as keyof typeof counts]++;
+		}
+		return counts;
 	}
 
 	async bulkUpdateTexture(updates: TextureUpdate[]): Promise<void> {
@@ -559,6 +642,27 @@ export class SQLiteBrainStorage implements IBrainStorage {
 				target.novelty_score = typeof target.texture.novelty_score === "number" ? target.texture.novelty_score : target.novelty_score;
 			}
 		});
+	}
+
+	async runDecay(asOf: Date = new Date()): Promise<number> {
+		let changed = 0;
+		await this.withObservations(async all => {
+			for (const observation of all) {
+				if (observation.texture?.salience === "foundational") continue;
+
+				const result = applyDecaySemantics(
+					observation.texture,
+					observation.last_accessed,
+					observation.created,
+					asOf
+				);
+				if (!result.changed) continue;
+
+				observation.texture = result.texture;
+				changed++;
+			}
+		});
+		return changed;
 	}
 
 	async updateObservationTexture(id: string, texture: Observation["texture"]): Promise<void> {
@@ -681,20 +785,33 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		return candidates.filter(c => c.observation.id !== id && !linked.has(c.observation.id)).slice(0, limit);
 	}
 
-	async hybridSearch(options: HybridSearchOptions): Promise<HybridSearchResult[]> {
-		const retrievalProfile = normalizeRetrievalProfile(options.retrieval_profile) ?? DEFAULT_RETRIEVAL_PROFILE;
-		const profileConfig = getRetrievalProfileConfig(retrievalProfile);
-		const limit = Math.max(1, options.limit ?? 10);
-		const minSimilarity = options.min_similarity ?? 0.3;
-		const querySignals = options.query_signals ?? extractQuerySignals(options.query || "");
+	/**
+	 * Builds the four lane pools (vector / keyword / entity / hint) from the observation
+	 * collection — the sqlite mirror of postgres's `generateLaneCandidates`. Single source
+	 * of the seed-building logic (token match, cosine similarity, hint match, sort + slice
+	 * per lane); both `hybridSearch` and the read-only `probeLanes` diagnostic call this,
+	 * so the two paths can't drift apart. `pools` lets a caller request a different pool
+	 * size per lane than a retrieval profile's own candidate_pool config (e.g. probeLanes'
+	 * flat `depth`); hybridSearch passes its profile's actual pools.
+	 */
+	private async generateLaneCandidates(
+		options: {
+			query?: string;
+			embedding?: number[];
+			territory?: string;
+			grip?: string[];
+			charge_phase?: string;
+			entity_id?: string;
+			queryHintTerms: string[];
+		},
+		pools: { vector: number; keyword: number; entity: number; hint: number }
+	): Promise<{
+		vectorSeeds: CandidateSeed[];
+		keywordSeeds: CandidateSeed[];
+		entitySeeds: CandidateSeed[];
+		hintSeeds: CandidateSeed[];
+	}> {
 		const queryTokens = tokenize(options.query || "");
-		const queryHintTerms = deriveQueryHintTerms({
-			query: options.query || "",
-			quoted_phrases: querySignals.quoted_phrases,
-			proper_names: querySignals.proper_names,
-			temporal: querySignals.temporal
-		});
-		const circadianBias = options.circadian_phase ? new Set(CIRCADIAN_PHASES[options.circadian_phase]?.retrieval_bias ?? []) : new Set<string>();
 
 		let rows = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
 		const hints = await this.readCollection<RetrievalHintArtifact>(KV_KEYS.retrieval_hints);
@@ -709,14 +826,6 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		if (options.grip?.length) rows = rows.filter(o => options.grip!.includes(o.texture?.grip ?? "present"));
 		if (options.charge_phase) rows = rows.filter(o => (o.texture?.charge_phase ?? "fresh") === options.charge_phase);
 
-		interface CandidateSeed {
-			obs: StoredObservation;
-			keywordRank: number;
-			vectorSimilarity?: number;
-			hasEntityMatch: boolean;
-			hintScore: number;
-			hintMatchedTypes: string[];
-		}
 		const seeds: CandidateSeed[] = [];
 		for (const obs of rows) {
 			const body = `${obs.content}\n${obs.summary ?? ""}`.toLowerCase();
@@ -735,7 +844,7 @@ export class SQLiteBrainStorage implements IBrainStorage {
 
 			const hasEntityMatch = Boolean(options.entity_id && obs.entity_id === options.entity_id);
 			const observationHints = hintsByObservation.get(obs.id) ?? this.deriveHintsForObservation(obs);
-			const hintMatch = computeRetrievalHintMatch(observationHints, queryHintTerms);
+			const hintMatch = computeRetrievalHintMatch(observationHints, options.queryHintTerms);
 			const hintScore = hintMatch.score;
 
 			if ((vectorSimilarity ?? 0) <= 0 && keywordRank <= 0 && !hasEntityMatch && hintScore <= 0) continue;
@@ -749,24 +858,79 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			});
 		}
 
-		const candidateMap = new Map<string, CandidateSeed>();
 		const vectorSeeds = seeds
 			.filter(seed => typeof seed.vectorSimilarity === "number" && (seed.vectorSimilarity ?? 0) > 0)
 			.sort((a, b) => (b.vectorSimilarity ?? 0) - (a.vectorSimilarity ?? 0))
-			.slice(0, profileConfig.candidate_pool.vector);
+			.slice(0, pools.vector);
 		const keywordSeeds = seeds
 			.filter(seed => seed.keywordRank > 0)
 			.sort((a, b) => b.keywordRank - a.keywordRank)
-			.slice(0, profileConfig.candidate_pool.keyword);
+			.slice(0, pools.keyword);
 		const entitySeeds = seeds
 			.filter(seed => seed.hasEntityMatch)
 			.sort((a, b) => toMillis(b.obs.created) - toMillis(a.obs.created))
-			.slice(0, profileConfig.candidate_pool.entity);
+			.slice(0, pools.entity);
 		const hintSeeds = seeds
 			.filter(seed => seed.hintScore >= 0.08)
 			.sort((a, b) => b.hintScore - a.hintScore)
-			.slice(0, Math.max(12, Math.floor(profileConfig.candidate_pool.keyword * 0.7)));
+			.slice(0, pools.hint);
 
+		return { vectorSeeds, keywordSeeds, entitySeeds, hintSeeds };
+	}
+
+	async hybridSearch(options: HybridSearchOptions): Promise<HybridSearchResult[]> {
+		const retrievalProfile = normalizeRetrievalProfile(options.retrieval_profile) ?? DEFAULT_RETRIEVAL_PROFILE;
+		// Discriminated on `mode` (not on retrievalProfile again) so the compiler narrows
+		// `profile_config` for free below — no `!` needed.
+		const scoringPlan: ScoringPlan = retrievalProfile === "legacy"
+			? { mode: "legacy" }
+			: (() => {
+				const baseConfig = getRetrievalProfileConfig(retrievalProfile);
+				const overrides = retrievalProfile === "fused" ? options.profile_overrides : undefined;
+				if (overrides) validateProfileOverrides(overrides);
+				return {
+					mode: "rrf" as const,
+					profile_config: overrides
+						? {
+							...baseConfig,
+							rrf_k: overrides.rrf_k ?? baseConfig.rrf_k,
+							lane_weights: overrides.lane_weights ?? baseConfig.lane_weights
+						}
+						: baseConfig
+				};
+			})();
+		const limit = Math.max(1, options.limit ?? 10);
+		const minSimilarity = options.min_similarity
+			?? (scoringPlan.mode === "legacy" ? 0.3 : scoringPlan.profile_config.min_score);
+		const querySignals = options.query_signals ?? extractQuerySignals(options.query || "");
+		const queryHintTerms = deriveQueryHintTerms({
+			query: options.query || "",
+			quoted_phrases: querySignals.quoted_phrases,
+			proper_names: querySignals.proper_names,
+			temporal: querySignals.temporal
+		});
+		const circadianBias = options.circadian_phase ? new Set(CIRCADIAN_PHASES[options.circadian_phase]?.retrieval_bias ?? []) : new Set<string>();
+
+		const pools = resolveCandidatePoolForProfile(retrievalProfile);
+		const { vectorSeeds, keywordSeeds, entitySeeds, hintSeeds } = await this.generateLaneCandidates(
+			{
+				query: options.query,
+				embedding: options.embedding,
+				territory: options.territory,
+				grip: options.grip,
+				charge_phase: options.charge_phase,
+				entity_id: options.entity_id,
+				queryHintTerms
+			},
+			{
+				vector: pools.vector,
+				keyword: pools.keyword,
+				entity: pools.entity,
+				hint: Math.max(12, Math.floor(pools.keyword * 0.7))
+			}
+		);
+
+		const candidateMap = new Map<string, CandidateSeed>();
 		const mergeSeed = (seed: CandidateSeed): void => {
 			const existing = candidateMap.get(seed.obs.id);
 			if (!existing) {
@@ -787,30 +951,93 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			mergeSeed(seed);
 		}
 
+		// 1-based position within each lane's own already-sorted/sliced pool
+		// (array index + 1) — read-only diagnostic map, kept separate from
+		// mergeSeed above so it can't perturb scoring.
+		const vectorRankById = new Map<string, number>();
+		vectorSeeds.forEach((seed, i) => vectorRankById.set(seed.obs.id, i + 1));
+		const keywordRankById = new Map<string, number>();
+		keywordSeeds.forEach((seed, i) => keywordRankById.set(seed.obs.id, i + 1));
+		const entityRankById = new Map<string, number>();
+		entitySeeds.forEach((seed, i) => entityRankById.set(seed.obs.id, i + 1));
+		const hintRankById = new Map<string, number>();
+		hintSeeds.forEach((seed, i) => hintRankById.set(seed.obs.id, i + 1));
+
+		// Legacy-scorer input only (RRF reads lane_positions, never this normalization —
+		// ADR §1 "rank in, magnitude out").
 		let maxKeywordRank = 0;
 		for (const seed of candidateMap.values()) {
 			if (seed.keywordRank > maxKeywordRank) maxKeywordRank = seed.keywordRank;
 		}
 
+		// Candidate-set statistics for the fused scorer's IDF-weighted signal boosts
+		// (ADR §3) — same merged candidate set as maxKeywordRank above. Only computed
+		// for the fused path; the legacy scorer never reads this.
+		const candidateSetStats: CandidateSetStats | undefined = scoringPlan.mode === "rrf"
+			? {
+				candidate_count: candidateMap.size,
+				// Not read by the scorer — diagnostic carried for the Surfacer decision
+				// log (ADR-RETRIEVAL-FUSION-RETUNE §4) and the benchmark artifact.
+				lane_sizes: {
+					vector: vectorSeeds.length,
+					keyword: keywordSeeds.length,
+					entity: entitySeeds.length,
+					hint: hintSeeds.length
+				},
+				signal_df: computeSignalDocumentFrequency(
+					querySignals,
+					Array.from(candidateMap.values(), seed => seed.obs),
+					scoringPlan.profile_config.query_signal_boosts
+				)
+			}
+			: undefined;
+
 		const results: HybridSearchResult[] = [];
 		for (const seed of candidateMap.values()) {
 			const { obs, keywordRank, vectorSimilarity, hasEntityMatch, hintScore, hintMatchedTypes } = seed;
-			const scored = scoreHybridCandidate({
-				observation: this.toPublicObservation(obs),
-				territory: obs.territory,
-				retrieval_profile: retrievalProfile,
-				query_signals: querySignals,
-				max_keyword_rank: maxKeywordRank,
-				vector_similarity: vectorSimilarity,
-				keyword_rank: keywordRank > 0 ? keywordRank : undefined,
-				hint_score: hintScore > 0 ? hintScore : undefined,
-				entity_matched: hasEntityMatch,
-				novelty_score: typeof obs.novelty_score === "number"
-					? obs.novelty_score
-					: (typeof obs.texture?.novelty_score === "number" ? obs.texture.novelty_score : undefined),
-				circadian_bias_matched: circadianBias.has(obs.territory),
-				min_similarity: minSimilarity
-			});
+
+			const laneRanks: NonNullable<HybridSearchResult["lane_ranks"]> = {};
+			const vectorRank = vectorRankById.get(obs.id);
+			if (vectorRank !== undefined) laneRanks.vector = vectorRank;
+			const keywordLaneRank = keywordRankById.get(obs.id);
+			if (keywordLaneRank !== undefined) laneRanks.keyword = keywordLaneRank;
+			const entityRank = entityRankById.get(obs.id);
+			if (entityRank !== undefined) laneRanks.entity = entityRank;
+			const hintRank = hintRankById.get(obs.id);
+			if (hintRank !== undefined) laneRanks.hint = hintRank;
+
+			const circadianMatched = circadianBias.has(obs.territory);
+			const noveltyScore = typeof obs.novelty_score === "number"
+				? obs.novelty_score
+				: (typeof obs.texture?.novelty_score === "number" ? obs.texture.novelty_score : undefined);
+
+			const scored = scoringPlan.mode === "legacy"
+				? scoreHybridCandidateLegacy({
+					observation: this.toPublicObservation(obs),
+					territory: obs.territory,
+					retrieval_profile: "legacy",
+					query_signals: querySignals,
+					max_keyword_rank: maxKeywordRank,
+					vector_similarity: vectorSimilarity,
+					keyword_rank: keywordRank > 0 ? keywordRank : undefined,
+					hint_score: hintScore > 0 ? hintScore : undefined,
+					entity_matched: hasEntityMatch,
+					novelty_score: noveltyScore,
+					circadian_bias_matched: circadianMatched,
+					min_similarity: minSimilarity
+				})
+				: scoreHybridCandidate({
+					observation: this.toPublicObservation(obs),
+					territory: obs.territory,
+					profile_config: scoringPlan.profile_config,
+					query_signals: querySignals,
+					lane_positions: laneRanks,
+					vector_similarity: vectorSimilarity,
+					keyword_ts_rank: keywordRank > 0 ? keywordRank : undefined,
+					novelty_score: noveltyScore,
+					circadian_bias_matched: circadianMatched,
+					min_score: minSimilarity
+				}, candidateSetStats);
 			if (!scored) continue;
 
 			results.push({
@@ -822,6 +1049,7 @@ export class SQLiteBrainStorage implements IBrainStorage {
 					: scored.match_sources,
 				vector_similarity: vectorSimilarity,
 				keyword_rank: keywordRank > 0 ? keywordRank : undefined,
+				lane_ranks: laneRanks,
 				score_breakdown: scored.score_breakdown
 			});
 		}
@@ -838,6 +1066,60 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			}
 		});
 		return reranked.results.slice(0, limit);
+	}
+
+	async probeLanes(options: LaneProbeOptions): Promise<LaneProbeResult> {
+		const depth = Math.min(Math.max(1, Math.floor(options.depth)), 5000);
+		const { vectorSeeds, keywordSeeds } = await this.generateLaneCandidates(
+			{
+				query: options.query,
+				embedding: options.embedding,
+				queryHintTerms: []
+			},
+			{ vector: depth, keyword: depth, entity: 0, hint: 0 }
+		);
+
+		const vectorRankById = new Map<string, number>();
+		const vectorSimById = new Map<string, number>();
+		vectorSeeds.forEach((seed, i) => {
+			vectorRankById.set(seed.obs.id, i + 1);
+			vectorSimById.set(seed.obs.id, seed.vectorSimilarity ?? 0);
+		});
+		const keywordRankById = new Map<string, number>();
+		const keywordTsRankById = new Map<string, number>();
+		keywordSeeds.forEach((seed, i) => {
+			keywordRankById.set(seed.obs.id, i + 1);
+			keywordTsRankById.set(seed.obs.id, seed.keywordRank);
+		});
+
+		let vectorTop1 = 0;
+		let vectorAtDepth = 0;
+		let keywordTop1 = 0;
+		let keywordAtDepth = 0;
+		const items = options.ids.map(id => {
+			const vectorRank = vectorRankById.get(id) ?? null;
+			const keywordRank = keywordRankById.get(id) ?? null;
+			if (vectorRank === 1) vectorTop1++;
+			if (vectorRank !== null) vectorAtDepth++;
+			if (keywordRank === 1) keywordTop1++;
+			if (keywordRank !== null) keywordAtDepth++;
+			return {
+				id,
+				vector_position: vectorRank,
+				vector_similarity: vectorSimById.get(id) ?? null,
+				keyword_position: keywordRank,
+				keyword_ts_rank: keywordTsRankById.get(id) ?? null
+			};
+		});
+
+		return {
+			depth,
+			lanes: {
+				vector: { returned: vectorSeeds.length, top1: vectorTop1, at_depth: vectorAtDepth },
+				keyword: { returned: keywordSeeds.length, top1: keywordTop1, at_depth: keywordAtDepth }
+			},
+			items
+		};
 	}
 
 	async recordMemoryCascade(observationIds: string[]): Promise<void> {
@@ -958,6 +1240,23 @@ export class SQLiteBrainStorage implements IBrainStorage {
 
 	async writeAnchors(anchors: Anchor[]): Promise<void> {
 		await this.writeCollection(KV_KEYS.anchors, anchors);
+	}
+
+	async touchAnchors(ids: string[]): Promise<void> {
+		if (!ids.length) return;
+		const idSet = new Set(ids);
+		const anchors = await this.readAnchors();
+		let changed = false;
+		const now = nowIso();
+		for (const anchor of anchors) {
+			if (!idSet.has(anchor.id)) continue;
+			anchor.activation_count = (anchor.activation_count || 0) + 1;
+			anchor.last_activated = now;
+			changed = true;
+		}
+		// The KV backend has no per-row UPDATE — this is still a single collection
+		// write (one row in kv_store), not N, mirroring the postgres single-UPDATE contract.
+		if (changed) await this.writeAnchors(anchors);
 	}
 
 	async readDesires(): Promise<Desire[]> {
@@ -1306,16 +1605,33 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		return rows.map(o => ({ observation: this.toPublicObservation(o), territory: o.territory }));
 	}
 
-	async batchGetEntityObservations(entityIds: string[], limitPerEntity = 20): Promise<Map<string, { observation: Observation; territory: string }[]>> {
+	async batchGetEntityObservations(entityIds: string[], limitPerEntity = 20, touchedAfter?: string): Promise<Map<string, { observation: Observation; territory: string }[]>> {
 		const result = new Map<string, { observation: Observation; territory: string }[]>();
 		const all = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
+		const touchedAfterMillis = touchedAfter ? toMillis(touchedAfter) : undefined;
 		for (const entityId of entityIds) {
 			const rows = all
 				.filter(o => o.entity_id === entityId)
+				.filter(o => touchedAfterMillis === undefined || Math.max(toMillis(o.created), toMillis(o.last_accessed)) >= touchedAfterMillis)
 				.sort((a, b) => toMillis(b.created) - toMillis(a.created))
 				.slice(0, Math.max(1, limitPerEntity))
 				.map(o => ({ observation: this.toPublicObservation(o), territory: o.territory }));
 			result.set(entityId, rows);
+		}
+		return result;
+	}
+
+	async countEntityObservations(entityIds: string[]): Promise<Map<string, { total: number; metabolized: number }>> {
+		const result = new Map<string, { total: number; metabolized: number }>();
+		const ids = new Set(entityIds);
+		const all = (await this.readCollection<StoredObservation>(KV_KEYS.observations)).map(o => this.normalizeObservation(o));
+		for (const entityId of entityIds) result.set(entityId, { total: 0, metabolized: 0 });
+		for (const observation of all) {
+			if (!observation.entity_id || !ids.has(observation.entity_id)) continue;
+			const counts = result.get(observation.entity_id);
+			if (!counts) continue;
+			counts.total++;
+			if (observation.texture?.charge_phase === "metabolized") counts.metabolized++;
 		}
 		return result;
 	}
@@ -1352,11 +1668,13 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		return created;
 	}
 
-	async listProposals(type?: string, status?: string, limit?: number): Promise<DaemonProposal[]> {
+	async listProposals(type?: string, status?: string, limit?: number, order: 'newest' | 'oldest' = 'newest'): Promise<DaemonProposal[]> {
 		let rows = await this.readCollection<DaemonProposal>(KV_KEYS.daemon_proposals);
 		if (type) rows = rows.filter(r => r.proposal_type === type);
 		if (status) rows = rows.filter(r => r.status === status);
-		rows.sort((a, b) => toMillis(b.proposed_at) - toMillis(a.proposed_at));
+		rows.sort((a, b) => order === 'oldest'
+			? toMillis(a.proposed_at) - toMillis(b.proposed_at)
+			: toMillis(b.proposed_at) - toMillis(a.proposed_at));
 		return rows.slice(0, Math.min(limit ?? 50, 200));
 	}
 
@@ -1402,13 +1720,59 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		const set = new Set<string>();
 		for (const check of checks) {
 			const exists = pending.some(r => r.proposal_type === check.type && r.source_id === check.sourceId && r.target_id === check.targetId);
-			if (exists) set.add(`${check.type}::${check.sourceId}::${check.targetId}`);
+			if (exists) set.add(proposalKey(check.type, check.sourceId, check.targetId));
 		}
 		return set;
 	}
 
-	async expireStaleProposals(_days: number): Promise<number> {
-		return 0;
+	async expireStaleProposals(days: number): Promise<number> {
+		// ops/ADR-JANITOR.md §1 — DELETE, not "reject" (mirrors postgres.ts). Scoped to
+		// EXPIRABLE_PROPOSAL_TYPES ONLY — a module constant, never daemon_config-driven.
+		const expirableTypes = new Set<string>(EXPIRABLE_PROPOSAL_TYPES);
+		const cutoffMs = Date.now() - days * 24 * 60 * 60 * 1000;
+		const rows = await this.readCollection<DaemonProposal>(KV_KEYS.daemon_proposals);
+
+		const toDelete = rows.filter(r => {
+			if (!expirableTypes.has(r.proposal_type)) return false;
+			if (r.status === "pending") return toMillis(r.proposed_at) < cutoffMs;
+			// One-time backfill (idempotent — matches nothing once every future
+			// expiry goes through the DELETE above instead of the old
+			// status='rejected' UPDATE): reviewed_at IS NULL is the reliable
+			// discriminator between an auto-expired tombstone and a real review —
+			// every real review path (human, AI reviewer, auto-absorption) goes
+			// through reviewProposal(), which always stamps reviewed_at.
+			//
+			// Historical: safe to delete once last_expiry has shown backfilled: 0 for a
+			// full quarter (first cleared 2026-09-06).
+			if (r.status === "rejected") return !r.reviewed_at;
+			return false;
+		});
+		if (toDelete.length === 0) return 0;
+
+		const deleteIds = new Set(toDelete.map(r => r.id));
+		await this.writeCollection(KV_KEYS.daemon_proposals, rows.filter(r => !deleteIds.has(r.id)));
+
+		const byType: Record<string, number> = {};
+		let expiredCount = 0;
+		let backfilledCount = 0;
+		for (const row of toDelete) {
+			byType[row.proposal_type] = (byType[row.proposal_type] ?? 0) + 1;
+			// mirrors postgres.ts's two-query split: pending rows came from the
+			// go-forward expiry, rejected rows from the one-time backfill.
+			if (row.status === "pending") expiredCount++;
+			else backfilledCount++;
+		}
+		await this.updateDaemonConfigData({
+			last_expiry: {
+				deleted: toDelete.length,
+				expired: expiredCount,
+				backfilled: backfilledCount,
+				by_type: byType,
+				at: nowIso()
+			}
+		});
+
+		return toDelete.length;
 	}
 
 	// ============ ORPHANS ============
@@ -1427,10 +1791,47 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		await this.writeCollection(KV_KEYS.orphan_observations, rows);
 	}
 
+	async markOrphans(observationIds: string[]): Promise<number> {
+		if (!observationIds.length) return 0;
+		const rows = await this.readCollection<OrphanObservation>(KV_KEYS.orphan_observations);
+		const seen = new Set(rows.map(r => r.observation_id));
+		let inserted = 0;
+		for (const observationId of observationIds) {
+			if (seen.has(observationId)) continue; // mirrors ON CONFLICT DO NOTHING
+			seen.add(observationId);
+			rows.push({
+				observation_id: observationId,
+				tenant_id: this.tenant,
+				first_marked: nowIso(),
+				rescue_attempts: 0,
+				status: "orphaned"
+			});
+			inserted++;
+		}
+		if (inserted > 0) await this.writeCollection(KV_KEYS.orphan_observations, rows);
+		return inserted;
+	}
+
 	async listOrphans(status?: string, limit?: number): Promise<OrphanObservation[]> {
 		let rows = await this.readCollection<OrphanObservation>(KV_KEYS.orphan_observations);
 		if (status) rows = rows.filter(r => r.status === status);
-		rows.sort((a, b) => toMillis(b.first_marked) - toMillis(a.first_marked));
+		// ops/ADR-JANITOR.md §1 — least-recently-attempted first (never-attempted
+		// outranks any attempt, however old), matching postgres' ORDER BY
+		// last_rescue_attempt ASC NULLS FIRST, first_marked ASC. This is not cosmetic:
+		// the caller takes the first 50, so the sort decides WHICH orphans get rescue
+		// attempts. first_marked ASC alone worked the SAME 50 oldest orphans every
+		// night; once those carried tombstoned proposals, the drain moved zero orphans
+		// forever — head-of-line blocking impossible by construction now. first_marked
+		// stays the tiebreak among ties (every orphan that has never been attempted),
+		// preserving the original FIFO detection order for the common case.
+		rows.sort((a, b) => {
+			const aAttempt = a.last_rescue_attempt ? toMillis(a.last_rescue_attempt) : null;
+			const bAttempt = b.last_rescue_attempt ? toMillis(b.last_rescue_attempt) : null;
+			if (aAttempt === null && bAttempt !== null) return -1;
+			if (aAttempt !== null && bAttempt === null) return 1;
+			if (aAttempt !== null && bAttempt !== null && aAttempt !== bAttempt) return aAttempt - bAttempt;
+			return toMillis(a.first_marked) - toMillis(b.first_marked);
+		});
 		return rows.slice(0, Math.min(limit ?? 50, 200));
 	}
 
@@ -1444,6 +1845,24 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			last_rescue_attempt: nowIso()
 		};
 		await this.writeCollection(KV_KEYS.orphan_observations, rows);
+	}
+
+	async incrementRescueAttempts(observationIds: string[]): Promise<number> {
+		if (!observationIds.length) return 0;
+		const wanted = new Set(observationIds);
+		const rows = await this.readCollection<OrphanObservation>(KV_KEYS.orphan_observations);
+		let updated = 0;
+		for (let i = 0; i < rows.length; i++) {
+			if (!wanted.has(rows[i].observation_id)) continue;
+			rows[i] = {
+				...rows[i],
+				rescue_attempts: rows[i].rescue_attempts + 1,
+				last_rescue_attempt: nowIso()
+			};
+			updated++;
+		}
+		if (updated > 0) await this.writeCollection(KV_KEYS.orphan_observations, rows);
+		return updated;
 	}
 
 	async updateOrphanStatus(observationId: string, status: "rescued" | "archived"): Promise<void> {
@@ -1502,6 +1921,35 @@ export class SQLiteBrainStorage implements IBrainStorage {
 		return { orphaned: orphaned.length, rescued, archived, oldest_days: oldestDays };
 	}
 
+	async getOldestPendingProposalDays(): Promise<number | null> {
+		// ops/ADR-JANITOR.md §2.1 instance eight — same EXPIRABLE_PROPOSAL_TYPES scope
+		// as postgres.ts and expireStaleProposals below; salience_regrade is
+		// deliberately non-expirable and deliberately long-pending, so leaving it
+		// unscoped here would light this alarm permanently the moment one crosses
+		// 21 days.
+		const expirableTypes = new Set<string>(EXPIRABLE_PROPOSAL_TYPES);
+		const rows = await this.readCollection<DaemonProposal>(KV_KEYS.daemon_proposals);
+		const pending = rows.filter(r => r.status === "pending" && expirableTypes.has(r.proposal_type));
+		if (!pending.length) return null;
+		const oldestMs = Math.min(...pending.map(r => toMillis(r.proposed_at)).filter(Boolean));
+		if (!oldestMs) return null;
+		return Math.floor((Date.now() - oldestMs) / (1000 * 60 * 60 * 24));
+	}
+
+	// ============ VALENCE LEXICON (ops/ADR-VALENCE-FLOOR.md, slice 0) ============
+
+	async readChargeValence(): Promise<ChargeValenceRow[]> {
+		return this.readCollection<ChargeValenceRow>(KV_KEYS.charge_valence);
+	}
+
+	async upsertChargeValence(rows: ChargeValenceRow[]): Promise<void> {
+		if (rows.length === 0) return;
+		const existing = await this.readCollection<ChargeValenceRow>(KV_KEYS.charge_valence);
+		const byCharge = new Map(existing.map(row => [row.charge, row]));
+		for (const row of rows) byCharge.set(row.charge, row);
+		await this.writeCollection(KV_KEYS.charge_valence, [...byCharge.values()]);
+	}
+
 	async getTopCascadePairs(limit = 20): Promise<Array<{ obs_id_a: string; obs_id_b: string; count: number }>> {
 		const rows = await this.readCollection<CascadePair>(KV_KEYS.memory_cascade);
 		return rows
@@ -1538,8 +1986,32 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			.slice(0, Math.max(1, limit));
 	}
 
-	async findOrphanCandidates(cutoffDate: string, limit: number): Promise<Observation[]> {
+	/**
+	 * ops/ADR-JANITOR.md §6.2 — findSimilarUnlinked minus the link/pending-proposal
+	 * exclusions, plus minSimilarity pushed straight into searchSimilar's own
+	 * min_similarity option (no new filtering logic needed here — the KV-store
+	 * backend's searchSimilar already supports a floor).
+	 */
+	async findSimilarByEmbedding(sourceId: string, limit: number, minSimilarity: number): Promise<Array<{ observation: Observation; territory: string; similarity: number }>> {
+		const source = (await this.readCollection<StoredObservation>(KV_KEYS.observations))
+			.map(o => this.normalizeObservation(o))
+			.find(o => o.id === sourceId);
+		if (!source?.embedding?.length) return [];
+
+		const similar = await this.searchSimilar({
+			embedding: source.embedding,
+			limit: Math.max(limit * 4, 40),
+			min_similarity: minSimilarity
+		});
+		return similar
+			.filter(s => s.observation.id !== sourceId)
+			.slice(0, Math.max(1, limit));
+	}
+
+	async findOrphanCandidates(cutoffDate: StateWindow, limit: number, arrival?: ArrivalBoundary): Promise<Observation[]> {
+		assertArrivalNotAfterCutoff(cutoffDate, arrival);
 		const cutoff = toMillis(cutoffDate);
+		const arrivalMillis = arrival ? toMillis(arrival) : undefined;
 		const cap = Math.max(1, Math.min(limit, 500));
 		const orphans = await this.readCollection<OrphanObservation>(KV_KEYS.orphan_observations);
 		const alreadyMarked = new Set(orphans.map(o => o.observation_id));
@@ -1549,7 +2021,64 @@ export class SQLiteBrainStorage implements IBrainStorage {
 			.filter(o => !o.entity_id)
 			.filter(o => (o.access_count ?? 0) <= 1)
 			.filter(o => toMillis(o.created) <= cutoff)
+			.filter(o => arrivalMillis === undefined || Math.max(toMillis(o.created), toMillis(o.last_accessed)) >= arrivalMillis)
 			.filter(o => !alreadyMarked.has(o.id))
+			.sort((a, b) => toMillis(a.created) - toMillis(b.created))
+			.slice(0, cap);
+
+		return candidates.map(c => this.toPublicObservation(c));
+	}
+
+	async findSalienceRegradeCandidates(minAgeCutoff: string, surfacedCutoff: string, limit: number): Promise<Observation[]> {
+		const minAgeMillis = toMillis(minAgeCutoff);
+		const surfacedCutoffMillis = toMillis(surfacedCutoff);
+		const cap = Math.max(1, Math.min(limit, 2000));
+
+		const [anchors, links, proposals, consolidations, capturedSkills] = await Promise.all([
+			this.readAnchors(),
+			this.readCollection<Link>(KV_KEYS.links),
+			this.readCollection<DaemonProposal>(KV_KEYS.daemon_proposals),
+			this.readCollection<ConsolidationCandidate>(KV_KEYS.consolidation_candidates),
+			this.readCollection<CapturedSkillArtifact>(KV_KEYS.captured_skills)
+		]);
+
+		const anchorTargets = new Set(
+			anchors.map(a => a.triggers_memory_id).filter((id): id is string => Boolean(id))
+		);
+		const linkedIds = new Set<string>();
+		for (const l of links) {
+			linkedIds.add(l.source_id);
+			linkedIds.add(l.target_id);
+		}
+		// Any status, not just pending — ops/ADR-JANITOR.md §5.5: rejection of a
+		// salience_regrade proposal must be a permanent tombstone, same anti-nag
+		// guarantee as the status-blind unique index gives the Postgres backend.
+		const priorRegradeIds = new Set(
+			proposals.filter(p => p.proposal_type === "salience_regrade").map(p => p.source_id)
+		);
+		const acceptedConsolidationSourceIds = new Set(
+			consolidations.filter(c => c.status === "accepted").flatMap(c => c.source_observation_ids)
+		);
+		const metabolizedBySkillIds = new Set(
+			capturedSkills.flatMap(cs => {
+				const ids = (cs.provenance as Record<string, unknown> | undefined)?.metabolized_observation_ids;
+				return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+			})
+		);
+
+		const candidates = (await this.readCollection<StoredObservation>(KV_KEYS.observations))
+			.map(o => this.normalizeObservation(o))
+			.filter(o => o.texture?.salience === "foundational")
+			.filter(o => o.territory !== "self")
+			.filter(o => (o.access_count ?? 0) <= 1)
+			.filter(o => toMillis(o.created) < minAgeMillis)
+			.filter(o => o.texture?.charge_phase !== "metabolized")
+			.filter(o => !o.last_surfaced_at || toMillis(o.last_surfaced_at) < surfacedCutoffMillis)
+			.filter(o => !anchorTargets.has(o.id))
+			.filter(o => !priorRegradeIds.has(o.id))
+			.filter(o => !acceptedConsolidationSourceIds.has(o.id))
+			.filter(o => !metabolizedBySkillIds.has(o.id))
+			.filter(o => !linkedIds.has(o.id))
 			.sort((a, b) => toMillis(a.created) - toMillis(b.created))
 			.slice(0, cap);
 
@@ -2264,12 +2793,11 @@ export class SQLiteBrainStorage implements IBrainStorage {
 	}
 }
 
-export function createSQLiteStorage(sqlitePath: string, tenant: string): SQLiteBrainStorage {
-	if (!ALLOWED_TENANTS.includes(tenant as typeof ALLOWED_TENANTS[number])) {
-		throw new Error(`Invalid tenant: ${tenant}`);
-	}
+export function createSQLiteStorage(sqlitePath: string, tenant: string, allowedTenants?: readonly string[]): SQLiteBrainStorage {
+	const normalizedAllowedTenants = normalizeAllowedTenants(allowedTenants);
+	if (!isAllowedTenant(tenant, normalizedAllowedTenants)) throw new Error(`Invalid tenant: ${tenant}`);
 	if (sqlitePath.includes("\0")) {
 		throw new Error("Invalid sqlite path");
 	}
-	return new SQLiteBrainStorage(sqlitePath, tenant);
+	return new SQLiteBrainStorage(sqlitePath, tenant, undefined, normalizedAllowedTenants);
 }

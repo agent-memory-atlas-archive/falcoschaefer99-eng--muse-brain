@@ -89,6 +89,11 @@ function makeWakeStorage(limbicConfig: { enabled: boolean; natal: unknown } | nu
 		readLatestWakeLog: vi.fn(async () => null),
 		listTaskChangesSince: vi.fn(async () => []),
 		listProjectDossiers: vi.fn(async () => []),
+		readAnchors: vi.fn(async () => []),
+		touchAnchors: vi.fn(async () => undefined),
+		readFoundationalObservations: vi.fn(async () => []),
+		getEmbeddingCoverage: vi.fn(async () => ({ total: 0, embedded: 0 })),
+		readDaemonConfig: vi.fn(async () => ({ tenant_id: "rainer", link_proposal_threshold: 0, data: {} })),
 		appendWakeLog: vi.fn(async () => undefined),
 		getLimbicConfig: vi.fn(async () => limbicConfig),
 	};

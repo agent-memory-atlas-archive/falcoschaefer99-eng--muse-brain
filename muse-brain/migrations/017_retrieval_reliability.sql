@@ -1,5 +1,5 @@
 -- ============================================================
--- Brain v5 — Migration 015: Retrieval Reliability (Sprint 4.5)
+-- Brain v5 — Migration 017: Retrieval Reliability (Sprint 4.5)
 -- ============================================================
 
 -- 1) Canonical project index for deterministic project routing.

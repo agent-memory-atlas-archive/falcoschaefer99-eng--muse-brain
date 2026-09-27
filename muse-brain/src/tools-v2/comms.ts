@@ -2,7 +2,8 @@
 // mind_letter (action: write/read), mind_context (action: set/get)
 
 import type { DeliveryStatus, Letter, Observation } from "../types";
-import { knownTenantNames, resolveTenantId } from "../constants";
+import { ALLOWED_TENANTS } from "../constants";
+import { DEFAULT_TENANT_ALIASES } from "../tenant-config";
 import { getTimestamp, generateId, toStringArray } from "../helpers";
 import type { ToolContext } from "./context";
 import { cleanText, lookupLetterById } from "./utils";
@@ -38,6 +39,33 @@ interface ExtractedFact {
 	fact_type: ExtractedFactType;
 	confidence: number;
 	source: "summary" | "key_point" | "open_thread";
+}
+
+/**
+ * Recipient resolution for cross-brain letters (mind_letter to=...). Uses the
+ * env-driven tenant vocabulary threaded through ToolContext by the worker boundary;
+ * falls back to the compiled-in defaults when the context carries none (daemon
+ * dispatch, direct tool tests). Preserves the old resolveTenantId semantics:
+ * trim + lowercase, then alias → canonical, then allowlist membership.
+ */
+function resolveRecipientTenant(context: ToolContext, raw: string): string | null {
+	const aliases = context.tenantAliases ?? DEFAULT_TENANT_ALIASES;
+	const allowed: readonly string[] = context.allowedTenants ?? ALLOWED_TENANTS;
+	const normalized = raw.trim().toLowerCase();
+	// ALLOWLIST BEATS ALIAS — same rule as tenant-config's resolveTenantAlias: a
+	// name that IS a configured tenant is never alias-redirected, so letters to
+	// "rook" reach the real 'rook' tenant on deployments where it exists rather
+	// than being shadowed into 'companion' by the default alias map.
+	if (allowed.includes(normalized)) return normalized;
+	const canonical = aliases[normalized] ?? normalized;
+	return allowed.includes(canonical) ? canonical : null;
+}
+
+/** Names a caller may use as a letter recipient: canonical tenants + their aliases. */
+function knownRecipientNames(context: ToolContext): string[] {
+	const aliases = context.tenantAliases ?? DEFAULT_TENANT_ALIASES;
+	const allowed: readonly string[] = context.allowedTenants ?? ALLOWED_TENANTS;
+	return Array.from(new Set([...allowed, ...Object.keys(aliases)])).sort();
 }
 
 type TaskPriority = typeof TASK_PRIORITIES[number];
@@ -495,9 +523,9 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 						return { error: "to must be a string" };
 					}
 					const requestedRecipient = args.to.trim();
-					const recipient = resolveTenantId(requestedRecipient);
+					const recipient = resolveRecipientTenant(context, requestedRecipient);
 					if (!recipient) {
-						return { error: `Unknown brain: ${requestedRecipient}. Known: ${knownTenantNames().join(", ")}` };
+						return { error: `Unknown brain: ${requestedRecipient}. Known: ${knownRecipientNames(context).join(", ")}` };
 					}
 					if (recipient === senderTenant) {
 						return { error: "Cross-brain letter recipient resolves to current tenant; omit 'to' for local letters." };

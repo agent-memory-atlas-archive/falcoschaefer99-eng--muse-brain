@@ -5,17 +5,25 @@
 // (a cheap 3B model, same as recap.ts) to make an actual judgment call on what's left:
 //   - link proposals, any confidence
 //   - orphan_rescue (rescue action only), confidence < 0.90
-//   - dedup proposals, any confidence
-// All three compare two REAL observations by id, which is what makes an LLM
+// Both compare two REAL observations by id, which is what makes an LLM
 // comparison possible.
+//
+// dedup is deliberately NOT fetched here (ops/ADR-JANITOR.md §6.4 point 3):
+// "never absorbed, never AI-reviewed." A dedup proposal asserts the two
+// observations are the SAME memory (one gets metabolized on accept) — a
+// judgment with a much higher error cost than "these two are related," and one
+// carrying only a single cosine as evidence (vs. orphan-archive's three failed
+// rescue attempts). It goes straight to Rook's digest, same review gate as
+// salience_regrade, and for the same reason: no automatic path exists at any
+// confidence.
 //
 // consolidation is intentionally EXCLUDED here: its source_id/target_id are the
 // same agent ENTITY id repeated twice (see tasks/kit-hygiene.ts), not observation
 // ids — findObservation() can never resolve either side, and the real accept-side
 // effect (candidate matching + skill-observation synthesis, see tools-v2/propose.ts)
-// is far more involved than a link/rescue/dedup accept. Left pending for human
-// review via mind_propose, same as skill_promotion, cross_agent, cross_tenant,
-// paradox_detected, recall_contract, fact_commitment.
+// is far more involved than a link/rescue accept. Left pending for human review
+// via mind_propose, same as dedup, salience_regrade, skill_promotion,
+// cross_agent, cross_tenant, paradox_detected, recall_contract, fact_commitment.
 //
 // NOT a daemon task inside runDaemonTasks() — it needs env.AI, which the
 // orchestrator doesn't have. Called directly from scheduled() instead, after
@@ -25,39 +33,58 @@
 import type { IBrainStorage } from "../storage/interface";
 import type { DaemonProposal, Observation } from "../types";
 import { createBidirectionalLink } from "./helpers";
+import type { WorkersAIClient } from "../ai";
+import type { DaemonRunContext } from "./types";
 
 const TEXT_GEN_MODEL = "@cf/meta/llama-3.2-3b-instruct";
-const BATCH_SIZE = 20;
-const FETCH_PER_TYPE = 20; // pool per type before the combined batch is capped
+// ops/ADR-JANITOR.md §0.5/§2/§9 commit 3: the backlog was never reached at the old
+// sizes — listProposals used to fetch the 20 NEWEST per type (LIFO), which starves
+// anything that's been pending a while, ages it out to expireStaleProposals(30) and
+// (pre-commit-2) laundered the timeout into a false rejection that fed §0.3's
+// governor. gatherCandidates now fetches FIFO (order: "oldest") instead, so raising
+// these two just widens how much of the real backlog a single night can reach.
+const BATCH_SIZE = 90;
+const FETCH_PER_TYPE = 200; // pool per type before the combined batch is capped
 const ORPHAN_RESCUE_ABSORBED_THRESHOLD = 0.90; // absorption.ts already took >= this
 const MIN_SIMILARITY_FOR_AI_ACCEPT = 0.60; // model can't override a floor this low — excessive-agency guard
 const MAX_CONTENT_CHARS = 500; // keep the prompt small — the 3B model works better concise
 const MAX_REASON_CHARS = 300;
-
-type AiTextGenRun = (
-	model: string,
-	input: { messages: Array<{ role: string; content: string }>; max_tokens?: number }
-) => Promise<{ response: string }>;
 
 interface ReviewDecision {
 	decision: "accept" | "reject";
 	reason: string;
 }
 
+export interface AiProposalReviewResult {
+	/** Proposals actually reviewed (accepted + rejected — not skipped). */
+	reviewed: number;
+	/** True when context.deadlineAt was reached mid-batch and the loop broke early. */
+	truncatedByDeadline: boolean;
+}
+
 /**
- * Reviews up to BATCH_SIZE pending link/orphan_rescue/dedup proposals via Workers AI.
- * Returns the number of proposals actually reviewed (accepted + rejected — not skipped).
+ * Reviews up to BATCH_SIZE pending link/orphan_rescue proposals via Workers AI.
+ * dedup is never fetched — see the header comment (ops/ADR-JANITOR.md §6.4).
  */
-export async function runAiProposalReview(storage: IBrainStorage, ai: Ai | undefined): Promise<number> {
-	if (!ai) return 0;
+export async function runAiProposalReview(
+	storage: IBrainStorage,
+	ai: WorkersAIClient | undefined,
+	context: DaemonRunContext = {}
+): Promise<AiProposalReviewResult> {
+	if (!ai) return { reviewed: 0, truncatedByDeadline: false };
 
 	let accepted = 0;
 	let rejected = 0;
 	let skipped = 0;
+	let truncatedByDeadline = false;
 
 	const candidates = await gatherCandidates(storage);
 
 	for (const proposal of candidates.slice(0, BATCH_SIZE)) {
+		if (context.deadlineAt !== undefined && Date.now() >= context.deadlineAt) {
+			truncatedByDeadline = true;
+			break;
+		}
 		try {
 			const outcome = await reviewOne(storage, ai, proposal);
 			if (outcome === "accepted") accepted++;
@@ -72,14 +99,22 @@ export async function runAiProposalReview(storage: IBrainStorage, ai: Ai | undef
 	const reviewed = accepted + rejected;
 	await storeSummary(storage, { reviewed, accepted, rejected, skipped });
 
-	return reviewed;
+	return { reviewed, truncatedByDeadline };
 }
 
 async function gatherCandidates(storage: IBrainStorage): Promise<DaemonProposal[]> {
-	const [links, orphanRescues, dedups] = await Promise.all([
-		storage.listProposals("link", "pending", FETCH_PER_TYPE),
-		storage.listProposals("orphan_rescue", "pending", FETCH_PER_TYPE),
-		storage.listProposals("dedup", "pending", FETCH_PER_TYPE)
+	// FIFO, not the storage default: ops/ADR-JANITOR.md §0.5 — listProposals's
+	// default "newest" order took the 20 NEWEST per type, so a backlog older than
+	// one fetch window was never reached and aged out to expireStaleProposals(30).
+	// "oldest" pushes ORDER BY proposed_at ASC into the SQL LIMIT itself, which is
+	// what actually matters once the pending queue is deeper than FETCH_PER_TYPE —
+	// a caller-side re-sort of a "newest" fetch would still be missing the old end.
+	//
+	// dedup is deliberately not fetched here at all (not even for a zero-share
+	// slice) — ops/ADR-JANITOR.md §6.4 point 3: never AI-reviewed, full stop.
+	const [links, orphanRescues] = await Promise.all([
+		storage.listProposals("link", "pending", FETCH_PER_TYPE, "oldest"),
+		storage.listProposals("orphan_rescue", "pending", FETCH_PER_TYPE, "oldest")
 	]);
 
 	// absorption.ts already took orphan_rescue "archive" (any confidence) and
@@ -90,12 +125,15 @@ async function gatherCandidates(storage: IBrainStorage): Promise<DaemonProposal[
 	});
 
 	// Cap each type before concatenating so a flood of one type (e.g. links) can't
-	// starve the others out of the BATCH_SIZE slice taken by the caller.
-	const perType = Math.ceil(BATCH_SIZE / 3); // 7 each
-	return [...links.slice(0, perType), ...eligibleOrphanRescues.slice(0, perType), ...dedups.slice(0, perType)].slice(0, BATCH_SIZE);
+	// starve the other out of the BATCH_SIZE slice taken by the caller. link and
+	// orphan_rescue are the only 2 types this function ever fetches, so dividing
+	// by 2 is exact — ops/ADR-JANITOR.md §2's ceilings table and §9 commit 3's
+	// acceptance line both specify ceil(90/2) over two types.
+	const perType = Math.ceil(BATCH_SIZE / 2); // 45 each
+	return [...links.slice(0, perType), ...eligibleOrphanRescues.slice(0, perType)].slice(0, BATCH_SIZE);
 }
 
-async function reviewOne(storage: IBrainStorage, ai: Ai, proposal: DaemonProposal): Promise<"accepted" | "rejected" | "skipped"> {
+async function reviewOne(storage: IBrainStorage, ai: WorkersAIClient, proposal: DaemonProposal): Promise<"accepted" | "rejected" | "skipped"> {
 	const [sourceFound, targetFound] = await Promise.all([
 		storage.findObservation(proposal.source_id),
 		storage.findObservation(proposal.target_id)
@@ -141,8 +179,9 @@ async function reviewOne(storage: IBrainStorage, ai: Ai, proposal: DaemonProposa
 			await createBidirectionalLink(storage, proposal);
 			await storage.updateOrphanStatus(proposal.source_id, "rescued");
 		}
-		// dedup: no extra side effect on accept — mirrors mind_propose's existing
-		// behavior (dedup isn't special-cased there either; accept just marks it accepted).
+		// dedup can never reach here — gatherCandidates() never fetches it
+		// (ops/ADR-JANITOR.md §6.4 point 3). Its accept-side effect (link +
+		// metabolize the newer side) lives only in tools-v2/propose.ts.
 		await storage.reviewProposal(proposal.id, "accepted", feedbackNote);
 		return "accepted";
 	}
@@ -202,16 +241,16 @@ Respond with JSON only:
 {"decision": "accept" | "reject", "reason": "one sentence"}`;
 }
 
-async function runModelReview(ai: Ai, prompt: string): Promise<ReviewDecision | null> {
+async function runModelReview(ai: WorkersAIClient, prompt: string): Promise<ReviewDecision | null> {
 	let result: { response: string };
 	try {
-		result = await (ai.run as unknown as AiTextGenRun)(TEXT_GEN_MODEL, {
+		result = await ai.run(TEXT_GEN_MODEL, {
 			messages: [
 				{ role: "system", content: "You are a precise, concise memory curator. Respond with JSON only, no commentary." },
 				{ role: "user", content: prompt }
 			],
 			max_tokens: 200
-		});
+		}) as { response: string };
 	} catch (err) {
 		throw new Error(`Workers AI text generation failed: ${err instanceof Error ? err.message : "unknown error"}`);
 	}

@@ -3,7 +3,7 @@
 // Cross-tenant delegation and scheduled wake support.
 
 import type { Task, Letter, Entity, ProjectDossier, Observation } from "../types";
-import { ALLOWED_TENANTS } from "../constants";
+import { ALLOWED_TENANTS, type TenantId } from "../constants";
 import { getTimestamp, generateId, toStringArray } from "../helpers";
 import type { ToolContext } from "./context";
 import { cleanText } from "./utils";
@@ -495,8 +495,8 @@ function buildDefaultReviewerDescription(title: string, executorTaskId: string, 
 	return description ? [base, `Executor brief: ${description}`].join("\n\n") : base;
 }
 
-function isAllowedTenant(value: string): value is typeof ALLOWED_TENANTS[number] {
-	return ALLOWED_TENANTS.includes(value as typeof ALLOWED_TENANTS[number]);
+function isAllowedTenant(value: string): value is TenantId {
+	return ALLOWED_TENANTS.includes(value as TenantId);
 }
 
 function validateCreateTaskInput(

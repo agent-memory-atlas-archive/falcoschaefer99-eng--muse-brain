@@ -21,7 +21,14 @@
   "compatibility_date": "2025-09-27",
   "compatibility_flags": ["global_fetch_strictly_public", "nodejs_compat"],
   "observability": { "enabled": true },
-  "triggers": { "crons": ["0 3 * * *"] },
+  // No cron trigger on purpose (as of 2026-09-04). Nightly metabolism (decay/novelty)
+  // runs on the box via `rook-brain-daemon.timer` (see ops/rook-brain-daemon.service),
+  // not on this Worker — a Worker cron here would fire a SECOND nightly cycle on top
+  // of the box run, and it would die anyway on the Workers FREE plan's 10ms CPU cap
+  // (Cloudflare rejects a "limits": { "cpu_ms": ... } override on free — error 100328;
+  // the daemon crashed nightly with error 1102 exceededResources before this was found
+  // 2026-07-30). `scheduled()` in src/index.ts is kept as a safety-net no-op in case a
+  // cron trigger is ever re-added here by mistake.
   "ai": { "binding": "AI" },
   "hyperdrive": [
     {

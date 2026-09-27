@@ -2,7 +2,7 @@
 
 ## Built, audited, NOT published
 
-Package is at `/Users/falco/AI/muse-brain/cli/`. Built and bundled. Michael (security) and Reeve (code quality) both PASS on round 3. Nothing is committed yet.
+Package is at `/home/user/AI/muse-brain/cli/`. Built and bundled. Michael (security) and Reeve (code quality) both PASS on round 3. Nothing is committed yet.
 
 ## Test matrix
 

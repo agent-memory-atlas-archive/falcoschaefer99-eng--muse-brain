@@ -74,20 +74,35 @@ import type {
 	CapturedSkillRegistryHealth,
 	AgentLeaseRecord,
 	AgentAuditEvent,
-	AgentAuditEventFilter
+	AgentAuditEventFilter,
+	ChargeValenceRow
 } from "../types";
+import { EXPIRABLE_PROPOSAL_TYPES } from "../types";
 
-import { TERRITORIES, VALID_TERRITORIES, HARD_BOUNDARIES, RELATIONSHIP_GATES, CIRCADIAN_PHASES, ALLOWED_TENANTS } from "../constants";
-import { getTimestamp, calculateMomentumDecay, calculateAfterglowFade, generateId } from "../helpers";
+import { TERRITORIES, VALID_TERRITORIES, HARD_BOUNDARIES, RELATIONSHIP_GATES, CIRCADIAN_PHASES, ALLOWED_TENANTS, FOUNDATIONAL_LANE_CAP } from "../constants";
+import { isAllowedTenant, normalizeAllowedTenants } from "./tenant-scope";
+import { getTimestamp, calculateMomentumDecay, calculateAfterglowFade, generateId, rankFoundationalByPullStrength } from "../helpers";
 import {
 	DEFAULT_RETRIEVAL_PROFILE,
 	getRetrievalProfileConfig,
 	normalizeRetrievalProfile,
-	extractQuerySignals
+	extractQuerySignals,
+	validateProfileOverrides,
+	computeSignalDocumentFrequency
 } from "../retrieval/query-signals";
-import { scoreHybridCandidate } from "../retrieval/scoring";
+import {
+	scoreHybridCandidate,
+	scoreHybridCandidateLegacy,
+	resolveCandidatePoolForProfile,
+	type ScoringPlan,
+	type CandidateSetStats
+} from "../retrieval/scoring";
 import { deriveQueryHintTerms } from "../retrieval/hints";
 import { applyRetrievalRerank } from "../retrieval/rerank";
+import { proposalKey } from "./keys";
+import { DECAY_THRESHOLDS } from "../daemon/decay";
+import { assertArrivalNotAfterCutoff } from "../daemon/types";
+import type { ArrivalBoundary, StateWindow } from "../daemon/types";
 
 import type {
 	IBrainStorage,
@@ -96,6 +111,8 @@ import type {
 	SimilarResult,
 	HybridSearchOptions,
 	HybridSearchResult,
+	LaneProbeOptions,
+	LaneProbeResult,
 	TextureUpdate
 } from "./interface";
 
@@ -119,8 +136,17 @@ function parseJsonValue<T>(value: unknown, fallback: T): T {
 		if (!trimmed) return fallback;
 		try {
 			raw = JSON.parse(trimmed);
-		} catch {
-			break;
+		} catch (err) {
+			// A parse failure here (corruption, partial write, truncation) would otherwise
+			// be indistinguishable from "genuinely empty" — log so a future occurrence leaves
+			// a trace instead of silence, then return `fallback` directly. `raw` still holds
+			// the pre-parse (corrupt) value at this point, so falling through to the loop's
+			// `raw ?? fallback` return below would hand a direct caller (one that doesn't
+			// re-validate shape, e.g. readConversationContext) the corrupt string instead of
+			// its declared fallback. No per-call identifier (key/column name) is available at
+			// this layer, so the log only proves SOME parse failed, not where.
+			console.error("parseJsonValue: failed to parse stored JSON:", err instanceof Error ? err.message : err);
+			return fallback;
 		}
 	}
 	return (raw ?? fallback) as T;
@@ -133,9 +159,46 @@ function parseJsonRecord(value: unknown): Record<string, unknown> {
 		: {};
 }
 
+// Legacy safety valve for daemon_config.data. Direct postgres.js prepared statements
+// exposed a bad write path where JSON.stringify(data)::jsonb stored a JSONB scalar
+// string instead of an object. Heartbeat then spread that string into numeric character
+// keys, causing progressively huge blobs and RangeError: Too many properties to enumerate.
+export const MAX_LEGACY_DAEMON_CONFIG_STRING_CHARS = 1_000_000;
+
+export function normalizeDaemonConfigData(value: unknown): Record<string, unknown> {
+	if (typeof value === "string" && value.length > MAX_LEGACY_DAEMON_CONFIG_STRING_CHARS) {
+		return {};
+	}
+	return parseJsonRecord(value);
+}
+
+export function daemonConfigDataJson(sql: Pick<postgres.Sql, "json">, data: Record<string, unknown>): postgres.Parameter {
+	return sql.json(data as postgres.JSONValue);
+}
+
 function parseJsonArray<T>(value: unknown): T[] {
 	const parsed = parseJsonValue<unknown>(value, []);
 	return Array.isArray(parsed) ? parsed as T[] : [];
+}
+
+// ops/ADR-JANITOR.md §5.1 — a defensive backstop only, not the real cap. The interface
+// doc on readFoundationalObservations() assumes foundational salience stays rare (515
+// rows measured 2026-09-06); if that assumption is ever badly wrong, this bounds the
+// query's memory footprint instead of hydrating an unbounded result set. It is set far
+// above any realistic near-term corpus size on purpose: if it is ever the thing actually
+// truncating (rather than FOUNDATIONAL_LANE_CAP below), that is itself a signal something
+// upstream is marking far more of the corpus foundational than intended, and the honest
+// fix is to raise this deliberately and investigate, not to silently absorb it.
+const FOUNDATIONAL_SAFETY_VALVE = 10_000;
+
+// fix(brain): novelty exists as a dimension again — B1. Every creation path
+// (tools-v2/memory.ts) already sets texture.novelty_score: 1.0 in memory; this
+// mirrors that value onto the real `novelty_score` column at insert time so
+// retrieval (which reads the column, not the JSONB blob) sees it. Fallback
+// chain matches sqlite.ts:316-318, minus the `obs.novelty_score` first check —
+// Observation has no such top-level field on the Postgres path.
+function noveltyScoreForInsert(obs: Observation): number {
+	return typeof obs.texture?.novelty_score === "number" ? obs.texture.novelty_score : 1.0;
 }
 
 function rowToObservation(row: Record<string, unknown>): Observation {
@@ -148,6 +211,8 @@ function rowToObservation(row: Record<string, unknown>): Observation {
 		context: row.context as string | undefined,
 		mood: row.mood as string | undefined,
 		last_accessed: toISOString(row.last_accessed_at),
+		// ops/ADR-JANITOR.md §2.1 instance nine (commit 7c) — the real column, not texture.
+		last_surfaced_at: toISOString(row.last_surfaced_at),
 		access_count: (row.access_count as number) ?? 0,
 		links: (row.links as string[] | null) ?? [],
 		summary: row.summary as string | undefined,
@@ -318,17 +383,22 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 	constructor(
 		databaseUrl: string,
-		private tenant: string
+		private tenant: string,
+		private prepare = false,
+		allowedTenants: readonly string[] = ALLOWED_TENANTS
 	) {
-		// Same tenant validation as BrainStorage — DNS label rules, 3-63 chars.
-		if (!/^[a-z][a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(tenant)) {
+		this.allowedTenants = normalizeAllowedTenants(allowedTenants);
+		if (!isAllowedTenant(tenant, this.allowedTenants)) {
 			throw new Error("Invalid tenant ID");
 		}
 		this.databaseUrl = databaseUrl;
-		// prepare: false is REQUIRED for Hyperdrive — pooled connections don't
-		// support prepared statements across connection boundaries.
-		this.sql = postgres(databaseUrl, { prepare: false });
+		// Workers using Hyperdrive pass prepare: false because pooled connections
+		// do not support prepared statements across connection boundaries. Direct
+		// Postgres callers, including the box runner, explicitly pass prepare: true.
+		this.sql = postgres(databaseUrl, { prepare: this.prepare });
 	}
+
+	private readonly allowedTenants: readonly string[];
 
 	// ============ TENANT ============
 
@@ -336,11 +406,19 @@ export class PostgresBrainStorage implements IBrainStorage {
 		return this.tenant;
 	}
 
+	getAllowedTenants(): readonly string[] {
+		return this.allowedTenants;
+	}
+
 	forTenant(tenant: string): IBrainStorage {
-		if (!ALLOWED_TENANTS.includes(tenant as typeof ALLOWED_TENANTS[number])) {
+		if (!isAllowedTenant(tenant, this.allowedTenants)) {
 			throw new Error("Invalid tenant");
 		}
-		return new PostgresBrainStorage(this.databaseUrl, tenant);
+		return new PostgresBrainStorage(this.databaseUrl, tenant, this.prepare, this.allowedTenants);
+	}
+
+	async close(): Promise<void> {
+		await this.sql.end({ timeout: 5 });
 	}
 
 	// ============ TERRITORY VALIDATION ============
@@ -486,7 +564,8 @@ export class PostgresBrainStorage implements IBrainStorage {
 			await sql`
 				INSERT INTO observations (
 					id, tenant_id, content, territory, created_at, texture, context,
-					mood, last_accessed_at, access_count, links, summary, type, tags
+					mood, last_accessed_at, access_count, links, summary, type, tags,
+					novelty_score
 				) VALUES (
 					${obs.id},
 					${this.tenant},
@@ -501,7 +580,8 @@ export class PostgresBrainStorage implements IBrainStorage {
 					${obs.links ?? null},
 					${obs.summary ?? null},
 					${obs.type ?? null},
-					${obs.tags ?? null}
+					${obs.tags ?? null},
+					${noveltyScoreForInsert(obs)}
 				)
 				ON CONFLICT (id) DO UPDATE SET
 					content        = EXCLUDED.content,
@@ -514,7 +594,8 @@ export class PostgresBrainStorage implements IBrainStorage {
 					links          = EXCLUDED.links,
 					summary        = EXCLUDED.summary,
 					type           = EXCLUDED.type,
-					tags           = EXCLUDED.tags
+					tags           = EXCLUDED.tags,
+					novelty_score  = EXCLUDED.novelty_score
 			`;
 		}
 	}
@@ -533,7 +614,8 @@ export class PostgresBrainStorage implements IBrainStorage {
 		await this.sql`
 			INSERT INTO observations (
 				id, tenant_id, content, territory, created_at, texture, context,
-				mood, last_accessed_at, access_count, links, summary, type, tags, entity_id
+				mood, last_accessed_at, access_count, links, summary, type, tags, entity_id,
+				novelty_score
 			) VALUES (
 				${obs.id},
 				${this.tenant},
@@ -549,7 +631,8 @@ export class PostgresBrainStorage implements IBrainStorage {
 				${obs.summary ?? null},
 				${obs.type ?? null},
 				${obs.tags ?? null},
-				${obs.entity_id ?? null}
+				${obs.entity_id ?? null},
+				${noveltyScoreForInsert(obs)}
 			)
 			ON CONFLICT (id) DO UPDATE SET
 				content        = EXCLUDED.content,
@@ -563,15 +646,23 @@ export class PostgresBrainStorage implements IBrainStorage {
 				summary        = EXCLUDED.summary,
 				type           = EXCLUDED.type,
 				tags           = EXCLUDED.tags,
-				entity_id      = EXCLUDED.entity_id
+				entity_id      = EXCLUDED.entity_id,
+				novelty_score  = EXCLUDED.novelty_score
 		`;
 	}
 
 	async readAllTerritories(): Promise<{ territory: string; observations: Observation[] }[]> {
 		// Single query across all territories instead of 16 individual SELECTs.
+		// fix(brain): novelty exists as a dimension again — B2. novelty_score and
+		// last_surfaced_at added so daemon/cycle.ts's novelty stage (the only
+		// consumer of this method) can see them — last_surfaced_at is required
+		// (rowToObservation's real-column mapping has nothing to map without it);
+		// novelty_score is carried for parity even though the stage currently reads
+		// texture.novelty_score (already present via the `texture` column below).
 		const rows = await this.sql`
 			SELECT id, content, territory, created_at, texture, context, mood,
-			       last_accessed_at, access_count, links, summary, type, tags
+			       last_accessed_at, access_count, links, summary, type, tags,
+			       novelty_score, last_surfaced_at
 			FROM observations
 			WHERE tenant_id = ${this.tenant}
 			ORDER BY territory, created_at ASC
@@ -642,6 +733,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 					WHERE tenant_id = ${this.tenant}
 					  AND territory = ${filter.territory}
 					  AND (texture->>'grip') = ${filter.grip}
+					  AND (${filter.touched_after ?? null}::timestamptz IS NULL OR GREATEST(created_at, COALESCE(last_accessed_at, created_at)) >= ${filter.touched_after ?? null}::timestamptz)
 					ORDER BY created_at DESC
 					LIMIT ${fetchLimit}
 				` as Record<string, unknown>[];
@@ -652,6 +744,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 					FROM observations
 					WHERE tenant_id = ${this.tenant}
 					  AND territory = ${filter.territory}
+					  AND (${filter.touched_after ?? null}::timestamptz IS NULL OR GREATEST(created_at, COALESCE(last_accessed_at, created_at)) >= ${filter.touched_after ?? null}::timestamptz)
 					ORDER BY created_at DESC
 					LIMIT ${fetchLimit}
 				` as Record<string, unknown>[];
@@ -662,6 +755,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 					FROM observations
 					WHERE tenant_id = ${this.tenant}
 					  AND (texture->>'grip') = ${filter.grip}
+					  AND (${filter.touched_after ?? null}::timestamptz IS NULL OR GREATEST(created_at, COALESCE(last_accessed_at, created_at)) >= ${filter.touched_after ?? null}::timestamptz)
 					ORDER BY created_at DESC
 					LIMIT ${fetchLimit}
 				` as Record<string, unknown>[];
@@ -671,6 +765,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 					       last_accessed_at, access_count, links, summary, type, tags, entity_id
 					FROM observations
 					WHERE tenant_id = ${this.tenant}
+					  AND (${filter.touched_after ?? null}::timestamptz IS NULL OR GREATEST(created_at, COALESCE(last_accessed_at, created_at)) >= ${filter.touched_after ?? null}::timestamptz)
 					ORDER BY created_at DESC
 					LIMIT ${fetchLimit}
 				` as Record<string, unknown>[];
@@ -699,6 +794,12 @@ export class PostgresBrainStorage implements IBrainStorage {
 			if (filter.created_before) {
 				const before = new Date(filter.created_before).getTime();
 				filtered = filtered.filter(({ observation: obs }) => new Date(obs.created).getTime() <= before);
+			}
+			if (filter.touched_after) {
+				const touchedAfter = new Date(filter.touched_after).getTime();
+				filtered = filtered.filter(({ observation: obs }) =>
+					Math.max(new Date(obs.created).getTime(), obs.last_accessed ? new Date(obs.last_accessed).getTime() : new Date(obs.created).getTime()) >= touchedAfter
+				);
 			}
 			if (filter.type) {
 				filtered = filtered.filter(({ observation: obs }) => obs.type === filter.type);
@@ -740,6 +841,61 @@ export class PostgresBrainStorage implements IBrainStorage {
 		}
 	}
 
+	async readFoundationalObservations(): Promise<{ observation: Observation; territory: string }[]> {
+		try {
+			// Filtered by salience directly in SQL (not post-fetch like queryObservations'
+			// grip/territory combos) — foundational salience is the whole point of being
+			// recency-independent, so it must not sit behind a created_at DESC LIMIT window.
+			//
+			// ops/ADR-JANITOR.md §5.1 — this used to be `ORDER BY created_at DESC LIMIT 200`,
+			// which truncated by recency while buildFoundationLane (wake.ts) re-ranks whatever
+			// it's handed by calculatePullStrength: a high-pull-strength OLD foundational
+			// memory was being dropped here, before the ranker ever saw it, because this
+			// query's ordering and the lane's ordering disagreed and this one ran first. The
+			// real truncation happens after fetch, ranked by the same measure the lane uses,
+			// so what gets dropped is the least alive, not merely the oldest.
+			//
+			// The ORDER BY below exists ONLY to make FOUNDATIONAL_SAFETY_VALVE's LIMIT
+			// deterministic if it's ever actually hit (Reeve, post-hoc review of 0e26c36) —
+			// without one, "which 10,000 rows come back" is arbitrary and the ranking below
+			// then runs over an arbitrary subset. Deliberately NOT `created_at`/
+			// `last_accessed_at` — either would reintroduce, at a 10,000-row threshold, the
+			// exact recency-bias bug this fix removed. `md5(id)` is a stable, uniform,
+			// content-blind ordering: reproducible across runs, but doesn't systematically
+			// favor old/new/high-access rows the way any texture- or timestamp-derived
+			// ordering would.
+			const rows = await this.sql`
+				SELECT id, content, territory, created_at, texture, context, mood,
+				       last_accessed_at, access_count, links, summary, type, tags, entity_id
+				FROM observations
+				WHERE tenant_id = ${this.tenant}
+				  AND (texture->>'salience') = 'foundational'
+				ORDER BY md5(id)
+				LIMIT ${FOUNDATIONAL_SAFETY_VALVE}
+			` as Record<string, unknown>[];
+			const mapped = rows.map(row => ({ observation: rowToObservation(row), territory: row.territory as string }));
+			return rankFoundationalByPullStrength(mapped, FOUNDATIONAL_LANE_CAP);
+		} catch (err) {
+			console.error("readFoundationalObservations failed:", err instanceof Error ? err.message : "unknown error");
+			return [];
+		}
+	}
+
+	async countFoundationalObservations(): Promise<number> {
+		try {
+			const rows = await this.sql`
+				SELECT count(*)::int AS count
+				FROM observations
+				WHERE tenant_id = ${this.tenant}
+				  AND (texture->>'salience') = 'foundational'
+			` as { count: number }[];
+			return rows[0]?.count ?? 0;
+		} catch (err) {
+			console.error("countFoundationalObservations failed:", err instanceof Error ? err.message : "unknown error");
+			return 0;
+		}
+	}
+
 	async bulkUpdateTexture(updates: TextureUpdate[]): Promise<void> {
 		if (!updates.length) return;
 		try {
@@ -775,9 +931,15 @@ export class PostgresBrainStorage implements IBrainStorage {
 		const textures = updates.map(u => JSON.stringify(u.texture));
 		try {
 			// Single unnest UPDATE — one subrequest for all observations instead of N.
+			// fix(brain): novelty exists as a dimension again — B1. Mirrors
+			// texture.novelty_score onto the real column, matching sqlite.ts:634's
+			// existing behavior. COALESCE keeps the prior column value when the new
+			// texture doesn't carry a numeric novelty_score (same "don't touch what
+			// wasn't sent" semantics as sqlite's ternary).
 			await this.sql`
 				UPDATE observations
-				SET texture = updates.new_texture
+				SET texture = updates.new_texture,
+				    novelty_score = COALESCE((updates.new_texture->>'novelty_score')::real, observations.novelty_score)
 				FROM (
 					SELECT unnest(${ids}::text[]) AS id, unnest(${textures}::jsonb[]) AS new_texture
 				) AS updates
@@ -787,6 +949,80 @@ export class PostgresBrainStorage implements IBrainStorage {
 		} catch (err) {
 			console.error("bulkReplaceTexture failed:", err instanceof Error ? err.message : "unknown error");
 			throw new Error("Failed to bulk replace texture");
+		}
+	}
+
+	async runDecay(asOf: Date = new Date()): Promise<number> {
+		try {
+			// One UPDATE statement. Each CTE applies one dimension without replacing
+			// the JSONB document, so absent/unrelated texture fields survive intact.
+			const rows = await this.sql`
+				WITH params AS (
+					SELECT ${asOf}::timestamptz AS as_of
+				), aged AS (
+					SELECT o.id,
+					       o.texture,
+					       COALESCE(o.last_accessed_at, o.created_at) AS reference_at,   -- vividness, grip
+					       o.created_at                               AS age_at,         -- charge_phase (ops/ADR-JANITOR.md §4)
+					       params.as_of
+					FROM observations AS o
+					CROSS JOIN params
+					WHERE o.tenant_id = ${this.tenant}
+					  AND COALESCE(o.texture->>'salience', '') <> 'foundational'
+				), vivid_decay AS (
+					SELECT id,
+					       reference_at,
+					       age_at,
+					       as_of,
+					       CASE
+						       WHEN reference_at < as_of - (${DECAY_THRESHOLDS.vividnessCrystallineToVividDays} * INTERVAL '1 day')
+							    AND texture->>'vividness' = 'crystalline'
+						       THEN jsonb_set(texture, '{vividness}', '"vivid"'::jsonb)
+						       WHEN reference_at < as_of - (${DECAY_THRESHOLDS.vividnessVividToSoftDays} * INTERVAL '1 day')
+							    AND texture->>'vividness' = 'vivid'
+						       THEN jsonb_set(texture, '{vividness}', '"soft"'::jsonb)
+						       ELSE texture
+					       END AS texture
+					FROM aged
+				), grip_decay AS (
+					SELECT id,
+					       age_at,
+					       as_of,
+					       CASE
+						       WHEN reference_at < as_of - (${DECAY_THRESHOLDS.gripIronToStrongDays} * INTERVAL '1 day')
+							    AND texture->>'grip' = 'iron'
+						       THEN jsonb_set(texture, '{grip}', '"strong"'::jsonb)
+						       WHEN reference_at < as_of - (${DECAY_THRESHOLDS.gripStrongToPresentDays} * INTERVAL '1 day')
+							    AND texture->>'grip' = 'strong'
+						       THEN jsonb_set(texture, '{grip}', '"present"'::jsonb)
+						       ELSE texture
+					       END AS texture
+					FROM vivid_decay
+				), charge_decay AS (
+					SELECT id,
+					       CASE
+						       WHEN age_at < as_of - (${DECAY_THRESHOLDS.chargeFreshToActiveHours} * INTERVAL '1 hour')
+							    AND texture->>'charge_phase' = 'fresh'
+						       THEN jsonb_set(texture, '{charge_phase}', '"active"'::jsonb)
+						       WHEN age_at < as_of - (${DECAY_THRESHOLDS.chargeActiveToProcessingDays} * INTERVAL '1 day')
+							    AND texture->>'charge_phase' = 'active'
+						       THEN jsonb_set(texture, '{charge_phase}', '"processing"'::jsonb)
+						       ELSE texture
+					       END AS texture
+					FROM grip_decay
+				)
+				UPDATE observations AS o
+				SET texture = d.texture
+				FROM charge_decay AS d
+				WHERE o.tenant_id = ${this.tenant}
+				  AND o.id = d.id
+				  AND o.texture IS DISTINCT FROM d.texture
+				RETURNING o.id
+			`;
+			return rows.length;
+		} catch (err) {
+			console.error("runDecay failed:", err instanceof Error ? err.message : "unknown error");
+			throw new Error("Failed to run decay");
 		}
 	}
 
@@ -1323,6 +1559,25 @@ export class PostgresBrainStorage implements IBrainStorage {
 		} catch (err) {
 			console.error("writeAnchors failed:", err instanceof Error ? err.message : "unknown error");
 			throw new Error("Failed to write anchors");
+		}
+	}
+
+	async touchAnchors(ids: string[]): Promise<void> {
+		if (!ids.length) return;
+		try {
+			await this.sql`
+				UPDATE anchors
+				SET data = jsonb_set(
+					jsonb_set(data, '{activation_count}', to_jsonb(COALESCE((data->>'activation_count')::int, 0) + 1)),
+					'{last_activated}', to_jsonb(${getTimestamp()}::text)
+				)
+				WHERE tenant_id = ${this.tenant}
+				  AND id = ANY(${ids})
+			`;
+		} catch (err) {
+			// Best-effort — the wake payload already carries the bumped counts in memory,
+			// never fail a wake because the persisted activation_count couldn't be written.
+			console.error("touchAnchors failed:", err instanceof Error ? err.message : "unknown error");
 		}
 	}
 
@@ -2164,7 +2419,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 		}
 	}
 
-	async batchGetEntityObservations(entityIds: string[], limitPerEntity?: number): Promise<Map<string, { observation: Observation; territory: string }[]>> {
+	async batchGetEntityObservations(entityIds: string[], limitPerEntity?: number, touchedAfter?: string): Promise<Map<string, { observation: Observation; territory: string }[]>> {
 		if (entityIds.length === 0) return new Map();
 		const cap = limitPerEntity ?? 200;
 		try {
@@ -2175,6 +2430,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 				FROM observations
 				WHERE entity_id = ANY(${entityIds})
 				  AND tenant_id = ${this.tenant}
+				  AND (${touchedAfter ?? null}::timestamptz IS NULL OR GREATEST(created_at, COALESCE(last_accessed_at, created_at)) >= ${touchedAfter ?? null}::timestamptz)
 				ORDER BY entity_id, created_at DESC
 			`;
 
@@ -2201,6 +2457,32 @@ export class PostgresBrainStorage implements IBrainStorage {
 		}
 	}
 
+	async countEntityObservations(entityIds: string[]): Promise<Map<string, { total: number; metabolized: number }>> {
+		const result = new Map<string, { total: number; metabolized: number }>();
+		if (entityIds.length === 0) return result;
+		try {
+			const rows = await this.sql`
+				SELECT entity_id,
+				       COUNT(*)::int AS total,
+				       COUNT(*) FILTER (WHERE texture->>'charge_phase' = 'metabolized')::int AS metabolized
+				FROM observations
+				WHERE entity_id = ANY(${entityIds})
+				  AND tenant_id = ${this.tenant}
+				GROUP BY entity_id
+			`;
+			for (const row of rows) {
+				result.set(row.entity_id as string, {
+					total: Number(row.total) || 0,
+					metabolized: Number(row.metabolized) || 0
+				});
+			}
+			return result;
+		} catch (err) {
+			console.error("countEntityObservations failed:", err instanceof Error ? err.message : "unknown error");
+			throw new Error("Failed to count entity observations");
+		}
+	}
+
 	async queryEntityTagsForBackfill(): Promise<Array<{ id: string; entity_tags: string[] }>> {
 		try {
 			const rows = await this.sql`
@@ -2223,38 +2505,30 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 	// ============ HYBRID SEARCH (Sprint 2) ============
 
-	async hybridSearch(options: HybridSearchOptions): Promise<HybridSearchResult[]> {
-		const retrievalProfile = normalizeRetrievalProfile(options.retrieval_profile) ?? DEFAULT_RETRIEVAL_PROFILE;
-		const profileConfig = getRetrievalProfileConfig(retrievalProfile);
-		const limit = Math.min(options.limit ?? 10, 50);
-		const minSimilarity = options.min_similarity ?? 0.3;
-		const querySignals = options.query_signals ?? extractQuerySignals(options.query ?? "");
-		const queryHintTerms = deriveQueryHintTerms({
-			query: options.query ?? "",
-			quoted_phrases: querySignals.quoted_phrases,
-			proper_names: querySignals.proper_names,
-			temporal: querySignals.temporal
-		});
-
-		// ---- Phase 1: Candidate Generation ----
-
-		// Build a map from id → result so we can merge scores from both sources.
-		interface RawCandidate {
-			observation: ReturnType<typeof rowToObservation>;
-			territory: string;
-			vector_sim?: number;
-			keyword_rank?: number;
-			hint_score?: number;
-			hint_types?: string[];
-			novelty_score_raw?: number;
-			surface_count_raw?: number;
-			/** Candidate came in only via the entity query (no vector or keyword match). */
-			_entity_only?: boolean;
-			/** Candidate also matched via the entity query (already in map from vector/keyword). */
-			_entity_matched?: boolean;
-		}
-		const candidates = new Map<string, RawCandidate>();
-
+	/**
+	 * Runs all four lane queries (vector / keyword / entity / hint) and returns their
+	 * raw, already-ordered rows exactly as each lane's SQL orders them. Single source of
+	 * the lane SQL — both `hybridSearch` and the read-only `probeLanes` diagnostic call
+	 * this, so the two paths can never drift apart. `pools` lets a caller request a
+	 * different pool size per lane than a retrieval profile's own candidate_pool config
+	 * (e.g. probeLanes' flat `depth`); hybridSearch passes its profile's actual pools.
+	 */
+	private async generateLaneCandidates(
+		options: {
+			query?: string;
+			embedding?: number[];
+			territory?: string;
+			grip?: string[];
+			entity_id?: string;
+			queryHintTerms: string[];
+		},
+		pools: { vector: number; keyword: number; entity: number; hint: number }
+	): Promise<{
+		vectorRows: Record<string, unknown>[];
+		keywordRows: Record<string, unknown>[];
+		entityRows: Record<string, unknown>[];
+		hintRows: Record<string, unknown>[];
+	}> {
 		// Run vector and keyword queries in parallel (keyword is always available).
 		const vectorPromise: Promise<Record<string, unknown>[]> = (async () => {
 			if (!options.embedding) return [];
@@ -2267,61 +2541,76 @@ export class PostgresBrainStorage implements IBrainStorage {
 				return [];
 			}
 			const embeddingLiteral = `[${options.embedding.join(",")}]`;
-			const vectorLimit = profileConfig.candidate_pool.vector;
+			const vectorLimit = pools.vector;
+			// ef_search landmine (ADR-RETRIEVAL-FUSION-RETUNE §6 follow-up 1): hnsw.ef_search
+			// defaults to 40. The day the planner picks the HNSW index over the current Seq
+			// Scan, LIMIT vectorLimit would silently return at most ~ef_search rows across
+			// BOTH tenants sharing the (non-tenant-partitioned) index.
+			// set_config() is a regular function, so the value may be a bind parameter —
+			// SET LOCAL cannot take one (postgres.js sends it as $1 and Postgres rejects it
+			// with "syntax error at or near "$1"" — proven against the live DB 2026-09-05).
+			// is_local=true gives SET LOCAL semantics: scoped to this transaction, gone at
+			// commit. One extra round-trip at most: the existing single SELECT becomes
+			// SELECT set_config(...) + SELECT over the same sql.begin() connection.
+			// this.prepare/Hyperdrive apply identically inside a transaction as outside it.
+			const efSearch = Math.max(200, Math.min(1000, Math.floor(2 * vectorLimit))); // pgvector accepts 1..1000
 			try {
-				if (options.territory && options.grip?.length) {
-					return await this.sql`
-						SELECT id, content, territory, created_at, texture, context, mood,
-						       last_accessed_at, access_count, links, summary, type, tags,
-						       novelty_score, surface_count, entity_id,
-						       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
-						FROM observations
-						WHERE tenant_id = ${this.tenant}
-						  AND embedding IS NOT NULL
-						  AND territory = ${options.territory}
-						  AND (texture->>'grip') = ANY(${options.grip})
-						ORDER BY embedding <=> ${embeddingLiteral}::vector
-						LIMIT ${vectorLimit}
-					` as Record<string, unknown>[];
-				} else if (options.territory) {
-					return await this.sql`
-						SELECT id, content, territory, created_at, texture, context, mood,
-						       last_accessed_at, access_count, links, summary, type, tags,
-						       novelty_score, surface_count, entity_id,
-						       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
-						FROM observations
-						WHERE tenant_id = ${this.tenant}
-						  AND embedding IS NOT NULL
-						  AND territory = ${options.territory}
-						ORDER BY embedding <=> ${embeddingLiteral}::vector
-						LIMIT ${vectorLimit}
-					` as Record<string, unknown>[];
-				} else if (options.grip?.length) {
-					return await this.sql`
-						SELECT id, content, territory, created_at, texture, context, mood,
-						       last_accessed_at, access_count, links, summary, type, tags,
-						       novelty_score, surface_count, entity_id,
-						       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
-						FROM observations
-						WHERE tenant_id = ${this.tenant}
-						  AND embedding IS NOT NULL
-						  AND (texture->>'grip') = ANY(${options.grip})
-						ORDER BY embedding <=> ${embeddingLiteral}::vector
-						LIMIT ${vectorLimit}
-					` as Record<string, unknown>[];
-				} else {
-					return await this.sql`
-						SELECT id, content, territory, created_at, texture, context, mood,
-						       last_accessed_at, access_count, links, summary, type, tags,
-						       novelty_score, surface_count, entity_id,
-						       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
-						FROM observations
-						WHERE tenant_id = ${this.tenant}
-						  AND embedding IS NOT NULL
-						ORDER BY embedding <=> ${embeddingLiteral}::vector
-						LIMIT ${vectorLimit}
-					` as Record<string, unknown>[];
-				}
+				return await this.sql.begin(async (sql: any) => {
+					await sql`SELECT set_config('hnsw.ef_search', ${String(efSearch)}, true)`;
+					if (options.territory && options.grip?.length) {
+						return await sql`
+							SELECT id, content, territory, created_at, texture, context, mood,
+							       last_accessed_at, access_count, links, summary, type, tags,
+							       novelty_score, surface_count, entity_id,
+							       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
+							FROM observations
+							WHERE tenant_id = ${this.tenant}
+							  AND embedding IS NOT NULL
+							  AND territory = ${options.territory}
+							  AND (texture->>'grip') = ANY(${options.grip})
+							ORDER BY embedding <=> ${embeddingLiteral}::vector
+							LIMIT ${vectorLimit}
+						` as Record<string, unknown>[];
+					} else if (options.territory) {
+						return await sql`
+							SELECT id, content, territory, created_at, texture, context, mood,
+							       last_accessed_at, access_count, links, summary, type, tags,
+							       novelty_score, surface_count, entity_id,
+							       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
+							FROM observations
+							WHERE tenant_id = ${this.tenant}
+							  AND embedding IS NOT NULL
+							  AND territory = ${options.territory}
+							ORDER BY embedding <=> ${embeddingLiteral}::vector
+							LIMIT ${vectorLimit}
+						` as Record<string, unknown>[];
+					} else if (options.grip?.length) {
+						return await sql`
+							SELECT id, content, territory, created_at, texture, context, mood,
+							       last_accessed_at, access_count, links, summary, type, tags,
+							       novelty_score, surface_count, entity_id,
+							       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
+							FROM observations
+							WHERE tenant_id = ${this.tenant}
+							  AND embedding IS NOT NULL
+							  AND (texture->>'grip') = ANY(${options.grip})
+							ORDER BY embedding <=> ${embeddingLiteral}::vector
+							LIMIT ${vectorLimit}
+						` as Record<string, unknown>[];
+					} else {
+						return await sql`
+							SELECT id, content, territory, created_at, texture, context, mood,
+							       last_accessed_at, access_count, links, summary, type, tags,
+							       novelty_score, surface_count, entity_id,
+							       1 - (embedding <=> ${embeddingLiteral}::vector) AS vector_sim
+							FROM observations
+							WHERE tenant_id = ${this.tenant}
+							  AND embedding IS NOT NULL
+							ORDER BY embedding <=> ${embeddingLiteral}::vector
+							LIMIT ${vectorLimit}
+						` as Record<string, unknown>[];
+					}
+				});
 			} catch (err) {
 				console.error("hybridSearch vector query failed:", err instanceof Error ? err.message : "unknown error");
 				return [];
@@ -2330,7 +2619,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 		const keywordPromise: Promise<Record<string, unknown>[]> = (async () => {
 			if (!options.query?.trim()) return [];
-			const keywordLimit = profileConfig.candidate_pool.keyword;
+			const keywordLimit = pools.keyword;
 			// Convert space-separated query words to OR-joined for broader keyword matching.
 			// The vector search handles semantic precision; keywords are a boost signal.
 			const keywordOrQuery = options.query.trim().split(/\s+/).join(' OR ');
@@ -2397,7 +2686,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 		// 3. Entity-linked candidates (when entity_id filter is present)
 		const entityPromise: Promise<Record<string, unknown>[]> = (async () => {
 			if (!options.entity_id) return [];
-			const entityLimit = profileConfig.candidate_pool.entity;
+			const entityLimit = pools.entity;
 			try {
 				const rows = await this.sql`
 					SELECT id, content, territory, created_at, texture, context, mood,
@@ -2418,10 +2707,10 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 		// 4. Retrieval-hint candidates (Sprint 3B)
 		const hintPromise: Promise<Record<string, unknown>[]> = (async () => {
-			if (queryHintTerms.length === 0) return [];
-			const hintLimit = Math.max(12, Math.floor(profileConfig.candidate_pool.keyword * 0.7));
+			if (options.queryHintTerms.length === 0) return [];
+			const hintLimit = pools.hint;
 			const hintStrengthFloor = 0.55;
-			const ilikePatterns = queryHintTerms.map(term => `%${term.replace(/[%_]/g, "\\$&")}%`);
+			const ilikePatterns = options.queryHintTerms.map(term => `%${term.replace(/[%_]/g, "\\$&")}%`);
 			try {
 				let rows: Record<string, unknown>[];
 				if (options.territory && options.grip?.length) {
@@ -2526,6 +2815,90 @@ export class PostgresBrainStorage implements IBrainStorage {
 		})();
 
 		const [vectorRows, keywordRows, entityRows, hintRows] = await Promise.all([vectorPromise, keywordPromise, entityPromise, hintPromise]);
+		return { vectorRows, keywordRows, entityRows, hintRows };
+	}
+
+	async hybridSearch(options: HybridSearchOptions): Promise<HybridSearchResult[]> {
+		const retrievalProfile = normalizeRetrievalProfile(options.retrieval_profile) ?? DEFAULT_RETRIEVAL_PROFILE;
+		// Discriminated on `mode` (not on retrievalProfile again) so the compiler narrows
+		// `profile_config` for free inside the per-candidate loop below — no `!` needed.
+		const scoringPlan: ScoringPlan = retrievalProfile === "legacy"
+			? { mode: "legacy" }
+			: (() => {
+				const baseConfig = getRetrievalProfileConfig(retrievalProfile);
+				const overrides = retrievalProfile === "fused" ? options.profile_overrides : undefined;
+				if (overrides) validateProfileOverrides(overrides);
+				return {
+					mode: "rrf" as const,
+					profile_config: overrides
+						? {
+							...baseConfig,
+							rrf_k: overrides.rrf_k ?? baseConfig.rrf_k,
+							lane_weights: overrides.lane_weights ?? baseConfig.lane_weights
+						}
+						: baseConfig
+				};
+			})();
+		const limit = Math.min(options.limit ?? 10, 50);
+		const minSimilarity = options.min_similarity
+			?? (scoringPlan.mode === "legacy" ? 0.3 : scoringPlan.profile_config.min_score);
+		const querySignals = options.query_signals ?? extractQuerySignals(options.query ?? "");
+		const queryHintTerms = deriveQueryHintTerms({
+			query: options.query ?? "",
+			quoted_phrases: querySignals.quoted_phrases,
+			proper_names: querySignals.proper_names,
+			temporal: querySignals.temporal
+		});
+
+		// ---- Phase 1: Candidate Generation ----
+
+		// Build a map from id → result so we can merge scores from both sources.
+		interface RawCandidate {
+			observation: ReturnType<typeof rowToObservation>;
+			territory: string;
+			vector_sim?: number;
+			keyword_rank?: number;
+			hint_score?: number;
+			hint_types?: string[];
+			novelty_score_raw?: number;
+			surface_count_raw?: number;
+			/** Candidate came in only via the entity query (no vector or keyword match). */
+			_entity_only?: boolean;
+			/** Candidate also matched via the entity query (already in map from vector/keyword). */
+			_entity_matched?: boolean;
+		}
+		const candidates = new Map<string, RawCandidate>();
+
+		const pools = resolveCandidatePoolForProfile(retrievalProfile);
+		const { vectorRows, keywordRows, entityRows, hintRows } = await this.generateLaneCandidates(
+			{
+				query: options.query,
+				embedding: options.embedding,
+				territory: options.territory,
+				grip: options.grip,
+				entity_id: options.entity_id,
+				queryHintTerms
+			},
+			{
+				vector: pools.vector,
+				keyword: pools.keyword,
+				entity: pools.entity,
+				hint: Math.max(12, Math.floor(pools.keyword * 0.7))
+			}
+		);
+
+		// 1-based position within each lane's own ordered pool (array index + 1) —
+		// each lane's SQL already ORDERs BY its own criterion, so the row's index
+		// in these already-ordered arrays IS its rank. Read-only diagnostic map,
+		// kept separate from candidate merging below so it can't perturb scoring.
+		const vectorRankById = new Map<string, number>();
+		vectorRows.forEach((row, i) => vectorRankById.set(row.id as string, i + 1));
+		const keywordRankById = new Map<string, number>();
+		keywordRows.forEach((row, i) => keywordRankById.set(row.id as string, i + 1));
+		const entityRankById = new Map<string, number>();
+		entityRows.forEach((row, i) => entityRankById.set(row.id as string, i + 1));
+		const hintRankById = new Map<string, number>();
+		hintRows.forEach((row, i) => hintRankById.set(row.id as string, i + 1));
 
 		// Merge into candidates map — dedup by id, keep both scores if present.
 		for (const row of vectorRows) {
@@ -2605,14 +2978,37 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 		if (candidates.size === 0) return [];
 
-		// Normalize keyword ranks to 0–1 range for combining with vector similarity.
-		// ts_rank values are unbounded; find the max to normalize.
+		// Legacy-scorer input only (RRF reads lane_positions, never this normalization —
+		// ADR §1 "rank in, magnitude out"). ts_rank values are unbounded; find the max
+		// to normalize against for the frozen scorer's set-max keyword component.
 		let maxKeywordRank = 0;
 		for (const c of candidates.values()) {
 			if (c.keyword_rank !== undefined && c.keyword_rank > maxKeywordRank) {
 				maxKeywordRank = c.keyword_rank;
 			}
 		}
+
+		// Candidate-set statistics for the fused scorer's IDF-weighted signal boosts
+		// (ADR §3) — same merged candidate set as maxKeywordRank above. Only computed
+		// for the fused path; the legacy scorer never reads this.
+		const candidateSetStats: CandidateSetStats | undefined = scoringPlan.mode === "rrf"
+			? {
+				candidate_count: candidates.size,
+				// Not read by the scorer — diagnostic carried for the Surfacer decision
+				// log (ADR-RETRIEVAL-FUSION-RETUNE §4) and the benchmark artifact.
+				lane_sizes: {
+					vector: vectorRows.length,
+					keyword: keywordRows.length,
+					entity: entityRows.length,
+					hint: hintRows.length
+				},
+				signal_df: computeSignalDocumentFrequency(
+					querySignals,
+					Array.from(candidates.values(), c => c.observation),
+					scoringPlan.profile_config.query_signal_boosts
+				)
+			}
+			: undefined;
 
 		// ---- Phase 2: Score Modulation ----
 
@@ -2628,20 +3024,47 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 		for (const [, cand] of candidates) {
 			const { observation, territory, vector_sim, keyword_rank, hint_score, hint_types } = cand;
-			const scored = scoreHybridCandidate({
-				observation,
-				territory,
-				retrieval_profile: retrievalProfile,
-				query_signals: querySignals,
-				max_keyword_rank: maxKeywordRank,
-				vector_similarity: vector_sim,
-				keyword_rank,
-				hint_score,
-				entity_matched: Boolean(cand._entity_only || cand._entity_matched || (options.entity_id && observation.entity_id === options.entity_id)),
-				novelty_score: cand.novelty_score_raw,
-				circadian_bias_matched: circadianBiasSet.has(territory),
-				min_similarity: minSimilarity
-			});
+
+			const laneRanks: NonNullable<HybridSearchResult["lane_ranks"]> = {};
+			const vectorRank = vectorRankById.get(observation.id);
+			if (vectorRank !== undefined) laneRanks.vector = vectorRank;
+			const keywordLaneRank = keywordRankById.get(observation.id);
+			if (keywordLaneRank !== undefined) laneRanks.keyword = keywordLaneRank;
+			const entityRank = entityRankById.get(observation.id);
+			if (entityRank !== undefined) laneRanks.entity = entityRank;
+			const hintRank = hintRankById.get(observation.id);
+			if (hintRank !== undefined) laneRanks.hint = hintRank;
+
+			const entityMatched = Boolean(cand._entity_only || cand._entity_matched || (options.entity_id && observation.entity_id === options.entity_id));
+			const circadianMatched = circadianBiasSet.has(territory);
+
+			const scored = scoringPlan.mode === "legacy"
+				? scoreHybridCandidateLegacy({
+					observation,
+					territory,
+					retrieval_profile: "legacy",
+					query_signals: querySignals,
+					max_keyword_rank: maxKeywordRank,
+					vector_similarity: vector_sim,
+					keyword_rank,
+					hint_score,
+					entity_matched: entityMatched,
+					novelty_score: cand.novelty_score_raw,
+					circadian_bias_matched: circadianMatched,
+					min_similarity: minSimilarity
+				})
+				: scoreHybridCandidate({
+					observation,
+					territory,
+					profile_config: scoringPlan.profile_config,
+					query_signals: querySignals,
+					lane_positions: laneRanks,
+					vector_similarity: vector_sim,
+					keyword_ts_rank: keyword_rank,
+					novelty_score: cand.novelty_score_raw,
+					circadian_bias_matched: circadianMatched,
+					min_score: minSimilarity
+				}, candidateSetStats);
 			if (!scored) continue;
 
 			results.push({
@@ -2653,6 +3076,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 					: scored.match_sources,
 				vector_similarity: vector_sim,
 				keyword_rank,
+				lane_ranks: laneRanks,
 				score_breakdown: scored.score_breakdown
 			});
 		}
@@ -2670,6 +3094,62 @@ export class PostgresBrainStorage implements IBrainStorage {
 			}
 		});
 		return reranked.results.slice(0, limit);
+	}
+
+	async probeLanes(options: LaneProbeOptions): Promise<LaneProbeResult> {
+		const depth = Math.min(Math.max(1, Math.floor(options.depth)), 5000);
+		const { vectorRows, keywordRows } = await this.generateLaneCandidates(
+			{
+				query: options.query,
+				embedding: options.embedding,
+				queryHintTerms: []
+			},
+			{ vector: depth, keyword: depth, entity: 0, hint: 0 }
+		);
+
+		const vectorRankById = new Map<string, number>();
+		const vectorSimById = new Map<string, number>();
+		vectorRows.forEach((row, i) => {
+			const id = row.id as string;
+			vectorRankById.set(id, i + 1);
+			vectorSimById.set(id, Number(row.vector_sim));
+		});
+		const keywordRankById = new Map<string, number>();
+		const keywordTsRankById = new Map<string, number>();
+		keywordRows.forEach((row, i) => {
+			const id = row.id as string;
+			keywordRankById.set(id, i + 1);
+			keywordTsRankById.set(id, Number(row.text_rank));
+		});
+
+		let vectorTop1 = 0;
+		let vectorAtDepth = 0;
+		let keywordTop1 = 0;
+		let keywordAtDepth = 0;
+		const items = options.ids.map(id => {
+			const vectorRank = vectorRankById.get(id) ?? null;
+			const keywordRank = keywordRankById.get(id) ?? null;
+			if (vectorRank === 1) vectorTop1++;
+			if (vectorRank !== null) vectorAtDepth++;
+			if (keywordRank === 1) keywordTop1++;
+			if (keywordRank !== null) keywordAtDepth++;
+			return {
+				id,
+				vector_position: vectorRank,
+				vector_similarity: vectorSimById.get(id) ?? null,
+				keyword_position: keywordRank,
+				keyword_ts_rank: keywordTsRankById.get(id) ?? null
+			};
+		});
+
+		return {
+			depth,
+			lanes: {
+				vector: { returned: vectorRows.length, top1: vectorTop1, at_depth: vectorAtDepth },
+				keyword: { returned: keywordRows.length, top1: keywordTop1, at_depth: keywordAtDepth }
+			},
+			items
+		};
 	}
 
 	async recordMemoryCascade(observationIds: string[]): Promise<void> {
@@ -2750,26 +3230,55 @@ export class PostgresBrainStorage implements IBrainStorage {
 					${proposal.feedback_note ?? null},
 					NOW()
 				)
+				ON CONFLICT (tenant_id, proposal_type, source_id, target_id) DO NOTHING
 				RETURNING *
 			`;
-			return this._rowToProposal(rows[0] as Record<string, unknown>);
+			if (rows.length > 0) return this._rowToProposal(rows[0] as Record<string, unknown>);
+
+			const existing = await this.sql`
+				SELECT * FROM daemon_proposals
+				WHERE tenant_id = ${this.tenant}
+				  AND proposal_type = ${proposal.proposal_type}
+				  AND source_id = ${proposal.source_id}
+				  AND target_id = ${proposal.target_id}
+				LIMIT 1
+			`;
+			if (existing.length > 0) return this._rowToProposal(existing[0] as Record<string, unknown>);
+
+			throw new Error("proposal insert conflicted but no existing proposal was found");
 		} catch (err) {
 			console.error("createProposal failed:", err instanceof Error ? err.message : "unknown error");
 			throw new Error("Failed to create proposal");
 		}
 	}
 
-	async listProposals(type?: string, status?: string, limit?: number): Promise<DaemonProposal[]> {
+	async listProposals(type?: string, status?: string, limit?: number, order: 'newest' | 'oldest' = 'newest'): Promise<DaemonProposal[]> {
 		const cap = Math.min(limit ?? 50, 200);
 		try {
-			const rows = await this.sql`
-				SELECT * FROM daemon_proposals
-				WHERE tenant_id = ${this.tenant}
-				  AND (${type ?? null}::text IS NULL OR proposal_type = ${type ?? null})
-				  AND (${status ?? null}::text IS NULL OR status = ${status ?? null})
-				ORDER BY proposed_at DESC
-				LIMIT ${cap}
-			`;
+			// Two full query bodies, not a single template with an interpolated
+			// direction: postgres.js tagged templates have no identifier/keyword
+			// escaping (same constraint noted at :769 for the observation-list ORDER
+			// BY), so ASC vs DESC can't be a bound parameter. The direction changes
+			// which rows LIMIT keeps, not just their order — with a deep pending
+			// queue, DESC+LIMIT keeps the newest N and ASC+LIMIT keeps the oldest N;
+			// re-sorting a DESC result in JS would still be missing the old end.
+			const rows = order === 'oldest'
+				? await this.sql`
+					SELECT * FROM daemon_proposals
+					WHERE tenant_id = ${this.tenant}
+					  AND (${type ?? null}::text IS NULL OR proposal_type = ${type ?? null})
+					  AND (${status ?? null}::text IS NULL OR status = ${status ?? null})
+					ORDER BY proposed_at ASC
+					LIMIT ${cap}
+				`
+				: await this.sql`
+					SELECT * FROM daemon_proposals
+					WHERE tenant_id = ${this.tenant}
+					  AND (${type ?? null}::text IS NULL OR proposal_type = ${type ?? null})
+					  AND (${status ?? null}::text IS NULL OR status = ${status ?? null})
+					ORDER BY proposed_at DESC
+					LIMIT ${cap}
+				`;
 			return rows.map(r => this._rowToProposal(r as Record<string, unknown>));
 		} catch (err) {
 			console.error("listProposals failed:", err instanceof Error ? err.message : "unknown error");
@@ -2869,10 +3378,20 @@ export class PostgresBrainStorage implements IBrainStorage {
 			const sources = checks.map(c => c.sourceId);
 			const targets = checks.map(c => c.targetId);
 
+			// status = 'pending' is load-bearing, not an optimisation: it is what makes
+			// this the batch equivalent of proposalExists. Without it a proposal that was
+			// ever genuinely rejected (human review, the AI reviewer, or auto-absorption
+			// — see reviewProposal) suppresses its own regeneration forever, which would
+			// silently break the exhausted-orphan archival drain. expireStaleProposals no
+			// longer contributes to that risk: as of ops/ADR-JANITOR.md §1 it DELETES
+			// stale pending rows of an expirable type rather than marking them
+			// 'rejected', so a timed-out proposal simply stops existing and is free to
+			// be re-proposed on its own terms.
 			const rows = await this.sql`
 				SELECT proposal_type, source_id, target_id
 				FROM daemon_proposals
 				WHERE tenant_id = ${this.tenant}
+				  AND status = 'pending'
 				  AND (proposal_type, source_id, target_id) IN (
 				      SELECT unnest(${types}::text[]), unnest(${sources}::text[]), unnest(${targets}::text[])
 				  )
@@ -2880,7 +3399,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 			const existingKeys = new Set<string>();
 			for (const row of rows) {
-				existingKeys.add(`${row.proposal_type}:${row.source_id}:${row.target_id}`);
+				existingKeys.add(proposalKey(row.proposal_type as string, row.source_id as string, row.target_id as string));
 			}
 			return existingKeys;
 		} catch (err) {
@@ -2891,15 +3410,78 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 	async expireStaleProposals(days: number): Promise<number> {
 		try {
-			const rows = await this.sql`
-				UPDATE daemon_proposals
-				SET status = 'rejected', feedback_note = 'Auto-expired: pending > ' || ${days}::text || ' days'
+			const expirableTypes = [...EXPIRABLE_PROPOSAL_TYPES];
+
+			// ops/ADR-JANITOR.md §1 — DELETE, not "reject": a pending proposal nobody
+			// reviewed is not a rejection. The old UPDATE...status='rejected' tombstoned
+			// the pair via the status-blind unique index (idx_proposals_dedup) and
+			// silently made batchProposalExists' regeneration promise impossible. Scoped
+			// to EXPIRABLE_PROPOSAL_TYPES ONLY — a module constant, never
+			// daemon_config-driven (Michael's flag: a config write must never become a
+			// delete primitive). Every other type is a judgment for Rook; a rejection
+			// there stays a permanent tombstone (§1, §5.5) and must never be deleted.
+			const expiredRows = await this.sql`
+				DELETE FROM daemon_proposals
 				WHERE tenant_id = ${this.tenant}
 				  AND status = 'pending'
+				  AND proposal_type = ANY(${expirableTypes}::text[])
 				  AND proposed_at < NOW() - (${days}::text || ' days')::interval
-				RETURNING id
+				RETURNING id, proposal_type
 			`;
-			return rows.length;
+
+			// One-time backfill (idempotent — matches nothing once the DELETE above has
+			// fully replaced the old code path): rows tombstoned by the PREVIOUS
+			// expireStaleProposals, which set status='rejected' via a raw UPDATE — never
+			// through reviewProposal(), so reviewed_at stayed NULL — with no
+			// proposal_type filter at all. reviewed_at IS NULL is the reliable
+			// discriminator: every real review path (human via propose.ts, the AI
+			// reviewer, and auto-absorption) goes through reviewProposal(), which always
+			// stamps reviewed_at. Scoped to the SAME allowlist as the DELETE above — a
+			// rejected judgment-type proposal (consolidation, salience_regrade, ...)
+			// stays a permanent tombstone even if it got there via the old bug.
+			//
+			// Historical: safe to delete once last_expiry has shown backfilled: 0 for a
+			// full quarter (first cleared 2026-09-06).
+			const backfilledRows = await this.sql`
+				DELETE FROM daemon_proposals
+				WHERE tenant_id = ${this.tenant}
+				  AND status = 'rejected'
+				  AND proposal_type = ANY(${expirableTypes}::text[])
+				  AND reviewed_at IS NULL
+				RETURNING id, proposal_type
+			`;
+
+			const deletedRows = [...expiredRows, ...backfilledRows] as Record<string, unknown>[];
+			if (deletedRows.length > 0) {
+				const byType: Record<string, number> = {};
+				for (const row of deletedRows) {
+					const type = row.proposal_type as string;
+					byType[type] = (byType[type] ?? 0) + 1;
+				}
+				try {
+					const config = await this.readDaemonConfig();
+					await this.updateDaemonConfigData({
+						...(config.data as Record<string, unknown>),
+						// expired/backfilled kept separate (not just summed into `deleted`):
+						// backfilled should hit zero after night one, since it only clears the
+						// historical pre-§1 tombstone bug. If it's ever non-zero again after
+						// that, something outside reviewProposal() is creating unreviewed
+						// rejected rows — the SAME bug class §1 just closed — and a merged
+						// count would hide that signal completely.
+						last_expiry: {
+							deleted: deletedRows.length,
+							expired: expiredRows.length,
+							backfilled: backfilledRows.length,
+							by_type: byType,
+							at: getTimestamp()
+						}
+					});
+				} catch (breadcrumbErr) {
+					console.error("expireStaleProposals: failed to store last_expiry breadcrumb:", breadcrumbErr instanceof Error ? breadcrumbErr.message : breadcrumbErr);
+				}
+			}
+
+			return deletedRows.length;
 		} catch (err) {
 			console.error("expireStaleProposals failed:", err instanceof Error ? err.message : "unknown error");
 			return 0;
@@ -2921,14 +3503,43 @@ export class PostgresBrainStorage implements IBrainStorage {
 		}
 	}
 
+	async markOrphans(observationIds: string[]): Promise<number> {
+		// Deduplicate first: ON CONFLICT DO NOTHING tolerates intra-statement duplicates,
+		// but there is no point shipping them over the wire.
+		const ids = [...new Set(observationIds)];
+		if (!ids.length) return 0;
+		try {
+			// Single unnest INSERT — one subrequest for the whole batch instead of N.
+			const rows = await this.sql`
+				INSERT INTO orphan_observations (observation_id, tenant_id, first_marked, rescue_attempts, status)
+				SELECT id, ${this.tenant}, NOW(), 0, 'orphaned'
+				FROM unnest(${ids}::text[]) AS t(id)
+				ON CONFLICT (tenant_id, observation_id) DO NOTHING
+				RETURNING observation_id
+			`;
+			return rows.length;
+		} catch (err) {
+			console.error("markOrphans failed:", err instanceof Error ? err.message : "unknown error");
+			throw new Error("Failed to mark orphans");
+		}
+	}
+
 	async listOrphans(status?: string, limit?: number): Promise<OrphanObservation[]> {
 		const cap = Math.min(limit ?? 50, 200);
 		try {
+			// ops/ADR-JANITOR.md §1 — least-recently-attempted first (NULLS FIRST: never
+			// attempted at all outranks any attempt, however old), not oldest-marked
+			// first. first_marked ASC alone worked the SAME 50 oldest orphans every
+			// night; once those carried tombstoned proposals, the drain moved zero
+			// orphans forever — head-of-line blocking impossible by construction now,
+			// not merely unblocked this once. first_marked ASC stays as the tiebreak
+			// among ties (in practice: every orphan that has never been attempted),
+			// preserving today's FIFO detection order for the common case.
 			const rows = await this.sql`
 				SELECT * FROM orphan_observations
 				WHERE tenant_id = ${this.tenant}
 				  AND (${status ?? null}::text IS NULL OR status = ${status ?? null})
-				ORDER BY first_marked ASC
+				ORDER BY last_rescue_attempt ASC NULLS FIRST, first_marked ASC
 				LIMIT ${cap}
 			`;
 			return rows.map(r => this._rowToOrphan(r as Record<string, unknown>));
@@ -2950,6 +3561,26 @@ export class PostgresBrainStorage implements IBrainStorage {
 		} catch (err) {
 			console.error("incrementRescueAttempt failed:", err instanceof Error ? err.message : "unknown error");
 			throw new Error("Failed to increment rescue attempt");
+		}
+	}
+
+	async incrementRescueAttempts(observationIds: string[]): Promise<number> {
+		const ids = [...new Set(observationIds)];
+		if (!ids.length) return 0;
+		try {
+			// Single UPDATE — one subrequest for the whole rescue cycle instead of N.
+			const rows = await this.sql`
+				UPDATE orphan_observations
+				SET rescue_attempts = rescue_attempts + 1,
+				    last_rescue_attempt = NOW()
+				WHERE tenant_id = ${this.tenant}
+				  AND observation_id = ANY(${ids}::text[])
+				RETURNING observation_id
+			`;
+			return rows.length;
+		} catch (err) {
+			console.error("incrementRescueAttempts failed:", err instanceof Error ? err.message : "unknown error");
+			throw new Error("Failed to increment rescue attempts");
 		}
 	}
 
@@ -2987,7 +3618,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 				tenant_id: row.tenant_id as string,
 				link_proposal_threshold: (row.link_proposal_threshold as number) ?? 0.75,
 				last_threshold_update: row.last_threshold_update ? toISOString(row.last_threshold_update) : undefined,
-				data: (row.data as Record<string, unknown>) ?? {}
+				data: normalizeDaemonConfigData(row.data)
 			};
 		} catch (err) {
 			console.error("readDaemonConfig failed:", err instanceof Error ? err.message : "unknown error");
@@ -3013,12 +3644,12 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 	async updateDaemonConfigData(data: Record<string, unknown>): Promise<void> {
 		try {
-			const serialized = JSON.stringify(data);
+			const payload = daemonConfigDataJson(this.sql, data);
 			await this.sql`
 				INSERT INTO daemon_config (tenant_id, data)
-				VALUES (${this.tenant}, ${serialized}::jsonb)
+				VALUES (${this.tenant}, ${payload})
 				ON CONFLICT (tenant_id)
-				DO UPDATE SET data = ${serialized}::jsonb
+				DO UPDATE SET data = ${payload}
 			`;
 		} catch (err) {
 			console.error("updateDaemonConfigData failed:", err instanceof Error ? err.message : "unknown error");
@@ -3050,12 +3681,19 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 	async getOrphanStats(): Promise<{ orphaned: number; rescued: number; archived: number; oldest_days: number }> {
 		try {
+			// ops/ADR-JANITOR.md §2.1 — MIN(first_marked) must be FILTERed to status =
+			// 'orphaned', same as the count columns above: archiving sets `status` and
+			// never deletes the row, so an unfiltered MIN can only grow as archival
+			// (the drain's dominant exit) removes the oldest ACTIVE orphans, making
+			// oldest_days read as failure while the drain works. sqlite.ts's
+			// getOrphanStats already filters to orphaned rows for this same
+			// computation — this brings postgres in line with it.
 			const rows = await this.sql`
 				SELECT
 					COUNT(*) FILTER (WHERE status = 'orphaned')::int  AS orphaned,
 					COUNT(*) FILTER (WHERE status = 'rescued')::int   AS rescued,
 					COUNT(*) FILTER (WHERE status = 'archived')::int  AS archived,
-					EXTRACT(EPOCH FROM (NOW() - MIN(first_marked))) / 86400 AS oldest_days
+					EXTRACT(EPOCH FROM (NOW() - MIN(first_marked) FILTER (WHERE status = 'orphaned'))) / 86400 AS oldest_days
 				FROM orphan_observations
 				WHERE tenant_id = ${this.tenant}
 			`;
@@ -3069,6 +3707,116 @@ export class PostgresBrainStorage implements IBrainStorage {
 		} catch (err) {
 			console.error("getOrphanStats failed:", err instanceof Error ? err.message : "unknown error");
 			return { orphaned: 0, rescued: 0, archived: 0, oldest_days: 0 };
+		}
+	}
+
+	async countIronObservations(): Promise<number> {
+		try {
+			const rows = await this.sql`
+				SELECT count(*)::int AS count
+				FROM observations
+				WHERE tenant_id = ${this.tenant}
+				  AND (texture->>'grip') = 'iron'
+			` as { count: number }[];
+			return rows[0]?.count ?? 0;
+		} catch (err) {
+			console.error("countIronObservations failed:", err instanceof Error ? err.message : "unknown error");
+			return 0;
+		}
+	}
+
+	async getChargePhaseCounts(): Promise<{ fresh: number; active: number; processing: number; metabolized: number }> {
+		try {
+			const rows = await this.sql`
+				SELECT
+					COUNT(*) FILTER (WHERE (texture->>'charge_phase') = 'fresh')::int       AS fresh,
+					COUNT(*) FILTER (WHERE (texture->>'charge_phase') = 'active')::int      AS active,
+					COUNT(*) FILTER (WHERE (texture->>'charge_phase') = 'processing')::int  AS processing,
+					COUNT(*) FILTER (WHERE (texture->>'charge_phase') = 'metabolized')::int AS metabolized
+				FROM observations
+				WHERE tenant_id = ${this.tenant}
+			`;
+			const row = (rows[0] ?? {}) as Record<string, unknown>;
+			return {
+				fresh: (row.fresh as number) ?? 0,
+				active: (row.active as number) ?? 0,
+				processing: (row.processing as number) ?? 0,
+				metabolized: (row.metabolized as number) ?? 0
+			};
+		} catch (err) {
+			console.error("getChargePhaseCounts failed:", err instanceof Error ? err.message : "unknown error");
+			return { fresh: 0, active: 0, processing: 0, metabolized: 0 };
+		}
+	}
+
+	async getOldestPendingProposalDays(): Promise<number | null> {
+		try {
+			// ops/ADR-JANITOR.md §2.1 instance eight — scoped to EXPIRABLE_PROPOSAL_TYPES
+			// (the same module constant expireStaleProposals uses, never re-listed as
+			// literal strings here): salience_regrade is deliberately non-expirable and
+			// deliberately long-pending (§5.5's anti-nag tombstone requires it to sit
+			// pending until a human reviews it), so an unscoped query lights this alarm
+			// permanently the moment the first one crosses 21 days — and a permanently-lit
+			// alarm is exactly the unread console.warn §5.1 already complains about.
+			const expirableTypes = [...EXPIRABLE_PROPOSAL_TYPES];
+			const rows = await this.sql`
+				SELECT EXTRACT(EPOCH FROM (NOW() - MIN(proposed_at))) / 86400 AS oldest_days
+				FROM daemon_proposals
+				WHERE tenant_id = ${this.tenant}
+				  AND status = 'pending'
+				  AND proposal_type = ANY(${expirableTypes}::text[])
+			`;
+			const value = (rows[0] as Record<string, unknown> | undefined)?.oldest_days;
+			return value == null ? null : Math.round(value as number);
+		} catch (err) {
+			console.error("getOldestPendingProposalDays failed:", err instanceof Error ? err.message : "unknown error");
+			return null;
+		}
+	}
+
+	// ============ VALENCE LEXICON (ops/ADR-VALENCE-FLOOR.md, slice 0) ============
+
+	async readChargeValence(): Promise<ChargeValenceRow[]> {
+		try {
+			const rows = await this.sql`
+				SELECT charge, valence, method, model, classified_at, observation_count
+				FROM charge_valence
+				WHERE tenant_id = ${this.tenant}
+			` as Record<string, unknown>[];
+			return rows.map(row => ({
+				charge: row.charge as string,
+				valence: row.valence as ChargeValenceRow["valence"],
+				method: row.method as ChargeValenceRow["method"],
+				model: row.model as string,
+				classified_at: (row.classified_at instanceof Date ? row.classified_at.toISOString() : row.classified_at) as string,
+				observation_count: row.observation_count as number
+			}));
+		} catch (err) {
+			console.error("readChargeValence failed:", err instanceof Error ? err.message : "unknown error");
+			return [];
+		}
+	}
+
+	async upsertChargeValence(rows: ChargeValenceRow[]): Promise<void> {
+		if (rows.length === 0) return;
+		try {
+			// One statement per row (Promise.all) — same convention as
+			// bulkUpdateTexture: nightly-batch size (~hundreds, not thousands), and
+			// a 6-column upsert doesn't compose cleanly into a single unnest
+			// statement the way a single-column embedding update does.
+			await Promise.all(rows.map(row => this.sql`
+				INSERT INTO charge_valence (tenant_id, charge, valence, method, model, classified_at, observation_count)
+				VALUES (${this.tenant}, ${row.charge}, ${row.valence}, ${row.method}, ${row.model}, ${row.classified_at}, ${row.observation_count})
+				ON CONFLICT (tenant_id, charge) DO UPDATE SET
+					valence = excluded.valence,
+					method = excluded.method,
+					model = excluded.model,
+					classified_at = excluded.classified_at,
+					observation_count = excluded.observation_count
+			`));
+		} catch (err) {
+			console.error("upsertChargeValence failed:", err instanceof Error ? err.message : "unknown error");
+			throw new Error("Failed to upsert charge valence");
 		}
 	}
 
@@ -3147,7 +3895,52 @@ export class PostgresBrainStorage implements IBrainStorage {
 		}
 	}
 
-	async findOrphanCandidates(cutoffDate: string, limit: number): Promise<Observation[]> {
+	/**
+	 * ops/ADR-JANITOR.md §6.2 — findSimilarUnlinked minus the already_linked and
+	 * pending_proposals CTEs, plus minSimilarity pushed into the lateral's own
+	 * WHERE clause. Tenant filter present on both the source CTE and the
+	 * lateral, same shape as findSimilarUnlinked (🔒 Michael, §6.2).
+	 */
+	async findSimilarByEmbedding(sourceId: string, limit: number, minSimilarity: number): Promise<Array<{ observation: Observation; territory: string; similarity: number }>> {
+		try {
+			const rows = await this.sql`
+				WITH source AS (
+					SELECT embedding
+					FROM observations
+					WHERE tenant_id = ${this.tenant}
+					  AND id = ${sourceId}
+					  AND embedding IS NOT NULL
+				)
+				SELECT o.id, o.content, o.territory, o.created_at, o.texture,
+				       o.context, o.mood, o.last_accessed_at, o.access_count,
+				       o.links, o.summary, o.type, o.tags, o.entity_id,
+				       1 - (source.embedding <=> o.embedding) AS similarity
+				FROM source
+				CROSS JOIN LATERAL (
+					SELECT *
+					FROM observations
+					WHERE tenant_id = ${this.tenant}
+					  AND id != ${sourceId}
+					  AND embedding IS NOT NULL
+					  AND 1 - (source.embedding <=> embedding) >= ${minSimilarity}
+					ORDER BY source.embedding <=> embedding
+					LIMIT ${limit}
+				) AS o
+				ORDER BY similarity DESC
+			`;
+			return rows.map(row => ({
+				observation: rowToObservation(row as Record<string, unknown>),
+				territory: row.territory as string,
+				similarity: row.similarity as number
+			}));
+		} catch (err) {
+			console.error("findSimilarByEmbedding failed:", err instanceof Error ? err.message : "unknown error");
+			return [];
+		}
+	}
+
+	async findOrphanCandidates(cutoffDate: StateWindow, limit: number, arrival?: ArrivalBoundary): Promise<Observation[]> {
+		assertArrivalNotAfterCutoff(cutoffDate, arrival);
 		try {
 			const rows = await this.sql`
 				SELECT o.*
@@ -3158,6 +3951,7 @@ export class PostgresBrainStorage implements IBrainStorage {
 				  AND o.entity_id IS NULL
 				  AND o.access_count <= 1
 				  AND o.created_at < ${cutoffDate}::timestamptz
+				  AND (${arrival ?? null}::timestamptz IS NULL OR GREATEST(o.created_at, COALESCE(o.last_accessed_at, o.created_at)) >= ${arrival ?? null}::timestamptz)
 				  AND l1.source_id IS NULL
 				  AND l2.target_id IS NULL
 				  AND NOT EXISTS (
@@ -3170,6 +3964,55 @@ export class PostgresBrainStorage implements IBrainStorage {
 			return rows.map(r => rowToObservation(r as Record<string, unknown>));
 		} catch (err) {
 			console.error("findOrphanCandidates failed:", err instanceof Error ? err.message : "unknown error");
+			return [];
+		}
+	}
+
+	async findSalienceRegradeCandidates(minAgeCutoff: string, surfacedCutoff: string, limit: number): Promise<Observation[]> {
+		try {
+			const rows = await this.sql`
+				SELECT o.*
+				FROM observations o
+				WHERE o.tenant_id = ${this.tenant}
+				  AND (o.texture->>'salience') = 'foundational'
+				  AND o.territory <> 'self'
+				  AND o.access_count <= 1
+				  AND o.created_at < ${minAgeCutoff}::timestamptz
+				  AND COALESCE(o.texture->>'charge_phase', '') <> 'metabolized'
+				  AND (
+				        o.last_surfaced_at IS NULL
+				     OR o.last_surfaced_at < ${surfacedCutoff}::timestamptz
+				  )
+				  AND NOT EXISTS (
+				        SELECT 1 FROM anchors a
+				        WHERE a.tenant_id = o.tenant_id
+				          AND a.data->>'triggers_memory_id' = o.id
+				  )
+				  AND NOT EXISTS (
+				        SELECT 1 FROM daemon_proposals dp
+				        WHERE dp.tenant_id = o.tenant_id
+				          AND dp.proposal_type = 'salience_regrade'
+				          AND dp.source_id = o.id
+				  )
+				  AND NOT EXISTS (
+				        SELECT 1 FROM consolidation_candidates cc
+				        WHERE cc.tenant_id = o.tenant_id
+				          AND cc.status = 'accepted'
+				          AND o.id = ANY(cc.source_observation_ids)
+				  )
+				  AND NOT EXISTS (
+				        SELECT 1 FROM captured_skills cs
+				        WHERE cs.tenant_id = o.tenant_id
+				          AND (cs.provenance -> 'metabolized_observation_ids') @> to_jsonb(o.id)
+				  )
+				  AND NOT EXISTS (SELECT 1 FROM links l WHERE l.tenant_id = o.tenant_id AND l.source_id = o.id)
+				  AND NOT EXISTS (SELECT 1 FROM links l WHERE l.tenant_id = o.tenant_id AND l.target_id = o.id)
+				ORDER BY o.created_at ASC
+				LIMIT ${limit}
+			`;
+			return rows.map(r => rowToObservation(r as Record<string, unknown>));
+		} catch (err) {
+			console.error("findSalienceRegradeCandidates failed:", err instanceof Error ? err.message : "unknown error");
 			return [];
 		}
 	}
@@ -4535,6 +5378,6 @@ export class PostgresBrainStorage implements IBrainStorage {
 
 // ============ FACTORY HELPER ============
 
-export function createPostgresStorage(databaseUrl: string, tenant: string): PostgresBrainStorage {
-	return new PostgresBrainStorage(databaseUrl, tenant);
+export function createPostgresStorage(databaseUrl: string, tenant: string, prepare = false, allowedTenants?: readonly string[]): PostgresBrainStorage {
+	return new PostgresBrainStorage(databaseUrl, tenant, prepare, allowedTenants);
 }

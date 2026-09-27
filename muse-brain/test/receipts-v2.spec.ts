@@ -34,8 +34,8 @@ function makeProjectDossier(overrides: Partial<ProjectDossier> = {}): ProjectDos
 				repo_slug: 'dupin-service',
 				canonical_repo_url: 'git@github.com:funkatorium/dupin-service.git',
 				default_branch: 'main',
-				local_paths: ['/Users/falco/AI/rainer-workspace/dupin-service'],
-				artifact_roots: ['/Users/falco/AI/rainer-workspace/dupin-service/dist'],
+				local_paths: ['/home/user/AI/rainer-workspace/dupin-service'],
+				artifact_roots: ['/home/user/AI/rainer-workspace/dupin-service/dist'],
 				deploy: {
 					commands: ['npm run deploy'],
 					preview_urls: ['https://preview.dupin.example'],
@@ -180,7 +180,7 @@ describe('receipts v2 tool', () => {
 		expect(result.receipt.content).toContain('repo_url: git@github.com:funkatorium/dupin-service.git');
 		expect(result.receipt.content).toContain('branch: feat/retrieval-truth');
 		expect(result.receipt.content).toContain('default_branch: main');
-		expect(result.receipt.content).toContain('local_path: /Users/falco/AI/rainer-workspace/dupin-service');
+		expect(result.receipt.content).toContain('local_path: /home/user/AI/rainer-workspace/dupin-service');
 		expect(result.receipt.content).toContain('- src/tools-v2/receipts.ts');
 		expect(result.receipt.content).toContain('summary:');
 		expect(appendToTerritory).toHaveBeenCalledWith('craft', expect.objectContaining({
@@ -198,7 +198,7 @@ describe('receipts v2 tool', () => {
 					repo_slug: 'falcoschaefer99-eng/muse-brain',
 					canonical_repo_url: 'https://github.com/falcoschaefer99-eng/muse-brain.git',
 					default_branch: 'main',
-					local_paths: ['/Users/falco/AI/rainer-workspace/muse-brain-public'],
+					local_paths: ['/home/user/AI/rainer-workspace/muse-brain-public'],
 					artifact_roots: []
 				}
 			}
@@ -238,7 +238,7 @@ describe('receipts v2 tool', () => {
 		expect(result.receipt.content).toContain('project_name: MUSE Brain');
 		expect(result.receipt.content).toContain('repo_slug: falcoschaefer99-eng/muse-brain');
 		expect(result.receipt.content).toContain('repo_url: https://github.com/falcoschaefer99-eng/muse-brain.git');
-		expect(result.receipt.content).toContain('local_path: /Users/falco/AI/rainer-workspace/muse-brain-public');
+		expect(result.receipt.content).toContain('local_path: /home/user/AI/rainer-workspace/muse-brain-public');
 		expect(appendToTerritory).toHaveBeenCalledWith('craft', expect.objectContaining({
 			type: 'repo_receipt',
 			entity_id: project.id

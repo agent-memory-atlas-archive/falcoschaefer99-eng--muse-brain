@@ -1,14 +1,42 @@
 // ============ DAEMON TASK: LINK PROPOSAL GENERATION ============
 // Generates link proposals from vector similarity between fresh/active observations.
-// Uses tenant-tunable weights from daemon_config.data.
-// Confidence formula:
-//   With entity_weight:  similarity * sim_w + (shared_charges/max) * charge_w + (shared_entity ? 1 : 0) * entity_w
-//   Without entity_weight: similarity * sim_w + (shared_charges/max) * charge_w
+//
+// Confidence formula (ops/ADR-JANITOR.md §3, §9 commit 5):
+//   confidence = min(1, similarity + CHARGE_BONUS * chargeRatio)
+// Similarity is the ONLY creation gate (see the `candidate.similarity < threshold`
+// check below); charge overlap can only ever raise confidence above similarity,
+// never substitute for it. The previous formula blended similarity/charge/entity
+// as independently config-tunable weights and re-gated that blend against the
+// SAME threshold with a *different* quantity — at zero charge overlap, max
+// reachable confidence was 0.6 (default similarity_weight), so nothing could
+// ever clear a threshold above 0.6. A control loop (learning.ts) spent five
+// weeks raising that unreachable threshold to its 0.95 ceiling chasing a
+// formula that could never satisfy it (§0.3 — CONFIRMED on the live tenant:
+// current_threshold 0.95, pinned since 2026-07-30T03:00:53Z).
+//
+// tenant-tunable charge_weight/similarity_weight/entity_weight
+// (daemon_config.data, still echoed read-only by mind_health/health.ts) no
+// longer feed this calculation. Flagged, not fixed, here — out of scope for
+// this commit (ops/ADR-JANITOR.md §9 row 5 names proposals.ts only).
+//
+// *** MANDATORY RUNBOOK STEP — this fix is INERT without it ***
+// The live `link_proposal_threshold` sits at 0.95. This formula change alone
+// creates ZERO proposals while it stays there: similarity tops out at 1.0,
+// and the highest cosine ever observed on this corpus is 0.802
+// (ADR-RETRIEVAL-FUSION-RETUNE §0) — both are below 0.95. A one-time
+// `updateProposalThreshold(0.75)` call against the live tenant's
+// daemon_config is required to reset it. That is a live DATA correction, not
+// a code change, and does not ship in this commit. Do not consider commit 5
+// "done" — in the sense of actually creating link proposals again — until
+// that call has run. (ops/ADR-JANITOR.md §0.3: this exact class of
+// threshold-in-a-comment-and-a-ticket sat railed for five weeks last time.)
 
 import type { IBrainStorage } from "../../storage/interface";
 import type { DaemonTaskResult } from "../types";
 
 const BATCH_SIZE = 50;
+/** ops/ADR-JANITOR.md §3 — charge overlap's bonus weight; never a gate. */
+const CHARGE_BONUS = 0.1;
 
 export async function runProposalTask(storage: IBrainStorage): Promise<DaemonTaskResult> {
 	let proposals_created = 0;
@@ -16,14 +44,10 @@ export async function runProposalTask(storage: IBrainStorage): Promise<DaemonTas
 	const expired = await storage.expireStaleProposals(30);
 	if (expired > 0) console.log(`Proposals: auto-expired ${expired} stale pending proposal(s)`);
 
-	// Read config: threshold + tenant weights
+	// Read config: threshold only — see header comment on why the tenant-tunable
+	// weights formerly read from config.data no longer drive the formula.
 	const config = await storage.readDaemonConfig();
 	const threshold = config.link_proposal_threshold;
-	const weights = config.data as Record<string, number>;
-
-	const chargeWeight = weights.charge_weight ?? 0.4;
-	const similarityWeight = weights.similarity_weight ?? 0.6;
-	const entityWeight = weights.entity_weight as number | undefined;
 
 	// Query recent observations (batch of 50)
 	const candidates = await storage.queryObservations({
@@ -71,24 +95,12 @@ export async function runProposalTask(storage: IBrainStorage): Promise<DaemonTas
 				candidate.observation.entity_id != null &&
 				source.entity_id === candidate.observation.entity_id;
 
-			// Compute confidence
-			let confidence: number;
-			if (entityWeight !== undefined) {
-				confidence =
-					candidate.similarity * similarityWeight +
-					chargeRatio * chargeWeight +
-					(sharedEntity ? 1 : 0) * entityWeight;
-			} else {
-				confidence =
-					candidate.similarity * similarityWeight +
-					chargeRatio * chargeWeight;
-			}
-
-			// Clamp to [0, 1]
-			confidence = Math.min(1, Math.max(0, confidence));
-
-			// Only create proposal if confidence meets threshold
-			if (confidence < threshold) continue;
+			// Confidence: similarity is the only gate (already passed, above).
+			// Charge overlap is a bonus that can raise confidence above
+			// similarity — e.g. into absorption.ts's auto-link band — but can
+			// never substitute for similarity in deciding whether to create a
+			// proposal at all (ops/ADR-JANITOR.md §3).
+			const confidence = Math.min(1, candidate.similarity + CHARGE_BONUS * chargeRatio);
 
 			await storage.createProposal({
 				tenant_id: storage.getTenant(),

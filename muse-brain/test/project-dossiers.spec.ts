@@ -57,7 +57,7 @@ describe('project dossiers v2 tool', () => {
 			next_actions: [' write migration '],
 			workspace_routing: {
 				repo_slug: 'brain-surgery',
-				local_paths: ['/Users/falco/AI/rainer-workspace/brain-surgery'],
+				local_paths: ['/home/user/AI/rainer-workspace/brain-surgery'],
 				deploy: {
 					commands: ['npm run deploy']
 				}
@@ -77,7 +77,7 @@ describe('project dossiers v2 tool', () => {
 			metadata: expect.objectContaining({
 				workspace_routing: expect.objectContaining({
 					repo_slug: 'brain-surgery',
-					local_paths: ['/Users/falco/AI/rainer-workspace/brain-surgery']
+					local_paths: ['/home/user/AI/rainer-workspace/brain-surgery']
 				})
 			})
 		}));
@@ -86,7 +86,7 @@ describe('project dossiers v2 tool', () => {
 		expect(result.project.dossier).toEqual(dossier);
 		expect(result.project.workspace_routing).toEqual(expect.objectContaining({
 			repo_slug: 'brain-surgery',
-			local_paths: ['/Users/falco/AI/rainer-workspace/brain-surgery']
+			local_paths: ['/home/user/AI/rainer-workspace/brain-surgery']
 		}));
 	});
 

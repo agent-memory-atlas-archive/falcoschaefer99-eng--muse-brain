@@ -22,27 +22,57 @@ export function resolveAllowedTenants(env: Env): readonly string[] {
 }
 
 /**
+ * Compiled-in default aliases — the single source of truth for tenant vocabulary drift
+ * (the historical hardcoded map from constants.ts lives here now). Preserves the
+ * rook → companion mapping so deployments WITHOUT a TENANT_ALIASES env var keep
+ * accepting live clients that still say "rook" instead of 400ing them.
+ */
+export const DEFAULT_TENANT_ALIASES: Readonly<Record<string, string>> = {
+	"rook": "companion"
+};
+
+/**
  * Alias map for reconciling tenant vocabulary drift across deployments (e.g. a client
  * that still speaks "rook" while the server speaks "companion"). Format:
- * "alias1:canonical1,alias2:canonical2". Default: empty (no aliasing).
+ * "alias1:canonical1,alias2:canonical2". Default: DEFAULT_TENANT_ALIASES. Setting
+ * TENANT_ALIASES REPLACES the default map entirely (so an operator can also retire
+ * the built-in rook alias); an unset or unparsable value falls back to the default.
  */
 export function resolveTenantAliases(env: Env): Readonly<Record<string, string>> {
 	const raw = env.TENANT_ALIASES?.trim();
+	if (!raw) return DEFAULT_TENANT_ALIASES;
 	const out: Record<string, string> = {};
-	if (!raw) return out;
 	for (const pair of raw.split(",")) {
 		const [aliasRaw, canonicalRaw] = pair.split(":");
 		const alias = aliasRaw?.trim();
 		const canonical = canonicalRaw?.trim();
 		if (alias && canonical) out[alias] = canonical;
 	}
-	return out;
+	return Object.keys(out).length > 0 ? out : DEFAULT_TENANT_ALIASES;
 }
 
-/** Resolves an alias (e.g. "rook") to its canonical tenant name (e.g. "companion"). Unknown values pass through unchanged. */
+/**
+ * Resolves an alias (e.g. "rook") to its canonical tenant name (e.g. "companion").
+ * Input is trimmed + lowercased first — aliases and tenant ids are lowercase by
+ * convention, so this only widens accepted input case ("Rook" ≡ "rook"); it never
+ * changes the canonical result or the caller's allowlist check. This is the one
+ * place both entry paths (HTTP tenant header and mind_letter recipients) share
+ * their case semantics. Unknown values pass through lowercased.
+ *
+ * ALLOWLIST BEATS ALIAS — always. A name explicitly present in the resolved
+ * allowed-tenants list is a real configured tenant and is NEVER alias-redirected,
+ * neither by the compiled-in default map nor by an explicit TENANT_ALIASES entry.
+ * This is what keeps a deployment with ALLOWED_TENANTS="rook,rainer" (tenant_id
+ * 'rook' in the database) working: "rook" resolves to itself instead of being
+ * shadowed by the default rook → companion alias. Fresh self-hosters on the
+ * default allowlist (["companion","rainer"]) still get the rook → companion
+ * convenience, because 'rook' is not in their allowlist.
+ */
 export function resolveTenantAlias(env: Env, raw: string): string {
+	const normalized = raw.trim().toLowerCase();
+	if (resolveAllowedTenants(env).includes(normalized)) return normalized;
 	const aliases = resolveTenantAliases(env);
-	return aliases[raw] ?? raw;
+	return aliases[normalized] ?? normalized;
 }
 
 export function isKnownTenant(env: Env, tenant: string): boolean {

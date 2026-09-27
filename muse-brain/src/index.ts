@@ -24,22 +24,27 @@
 
 import type {
 	Env,
-	Observation,
 	JsonRpcRequest,
-	JsonRpcResponse,
-	TerritoryOverview,
-	IronGripEntry
+	JsonRpcResponse
 } from "./types";
 
-import { getTimestamp, getCurrentCircadianPhase, generateSummary, calculatePullStrength } from "./helpers";
+import { getCurrentCircadianPhase } from "./helpers";
 import { createStorage } from "./storage/index";
 import { TOOL_DEFS as TOOLS, executeTool } from "./tools-v2/index";
-import { createEmbeddingProvider } from "./embedding/index";
+import { createEmbeddingProvider, parseEmbedQueryPrefixEnv } from "./embedding/index";
+import { createWorkersAIBindingAdapter } from "./ai/binding";
 import { embedBackfillBatch } from "./embedding/backfill";
-import { runDaemonTasks } from "./daemon/index";
-import { runAiProposalReview } from "./daemon/ai-review";
 import { resolveAuth } from "./auth";
-import { resolveAllowedTenants, resolveTenantAlias, grantedTenantsFor } from "./tenant-config";
+import { resolveAllowedTenants, resolveTenantAlias, resolveTenantAliases, grantedTenantsFor } from "./tenant-config";
+import {
+	authorizeLeaseForTool,
+	isLeaseExpired,
+	normalizeLeaseMode,
+	resolveRequestLease,
+	type LeaseAuthorization,
+	type LeaseResolution
+} from "./security/leases";
+import type { IBrainStorage } from "./storage/interface";
 
 // ============ RATE LIMITING ============
 const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
@@ -48,17 +53,20 @@ const RATE_WINDOW = 60_000; // 1 minute in ms
 
 const MAX_TENANT_HEADER_LENGTH = 64;
 
-function resolveStorageConfig(env: Env): { backend: "postgres" | "sqlite"; databaseUrl?: string; sqlitePath?: string } {
+function resolveStorageConfig(env: Env): { backend: "postgres" | "sqlite"; databaseUrl?: string; sqlitePath?: string; allowedTenants: readonly string[] } {
+	const allowedTenants = resolveAllowedTenants(env);
 	const backendRaw = String(env.STORAGE_BACKEND ?? "postgres").toLowerCase();
 	if (backendRaw === "sqlite") {
 		return {
 			backend: "sqlite",
-			sqlitePath: env.SQLITE_PATH || "./muse-brain.sqlite"
+			sqlitePath: env.SQLITE_PATH || "./muse-brain.sqlite",
+			allowedTenants
 		};
 	}
 	return {
 		backend: "postgres",
-		databaseUrl: env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL
+		databaseUrl: env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL,
+		allowedTenants
 	};
 }
 
@@ -117,9 +125,16 @@ function validateBackfillRequestBody(rawBody: unknown): BackfillValidation {
  */
 function resolveLegacyTenantFromHeader(request: Request, env: Env): TenantResolution {
 	const rawTenant = request.headers.get("X-Brain-Tenant");
-	const tenant = (rawTenant?.trim() || "rainer");
+	const requested = (rawTenant?.trim() || "rainer");
 
-	if (!validateTenantHeaderFormat(tenant) || !resolveAllowedTenants(env).includes(tenant)) {
+	if (!validateTenantHeaderFormat(requested)) {
+		return { ok: false, status: 400, error: "Invalid tenant" };
+	}
+
+	// Aliases (e.g. "rook" → "companion") resolve on the legacy path too — same
+	// env-driven map the per-tenant-key cross-check uses. Storage always sees canonical.
+	const tenant = resolveTenantAlias(env, requested);
+	if (!resolveAllowedTenants(env).includes(tenant)) {
 		return { ok: false, status: 400, error: "Invalid tenant" };
 	}
 
@@ -153,9 +168,209 @@ function crossCheckTenantHeader(request: Request, env: Env, keyTenant: string): 
 	return { ok: true, tenant: keyTenant };
 }
 
+// ============ AGENT HOUSE — LEASE ENFORCEMENT (v1.8 trust layer) ============
+// Re-ported from the public v1.8 line after the v1.9.0 merge dropped it.
+// env.LEASE_ENFORCEMENT_MODE: "off" | "shadow" (default) | "required".
+// "required" rejects tool calls lacking a valid lease (401) or lacking the tool's
+// capability ("Lease denied"); "shadow" records/audits without blocking.
+
+function shouldAuditLeaseDecision(auth: LeaseAuthorization): boolean {
+	if (!auth.allowed) return true;
+	const op = auth.requirement.operation;
+	return op.endsWith(".write")
+		|| op.endsWith(".trigger")
+		|| op.endsWith(".link")
+		|| op.endsWith(".edit");
+}
+
+async function payloadHash(value: unknown): Promise<string | undefined> {
+	try {
+		const bytes = new TextEncoder().encode(JSON.stringify(value ?? {}));
+		const digest = await crypto.subtle.digest("SHA-256", bytes);
+		return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+	} catch {
+		return undefined;
+	}
+}
+
+async function recordPresentedLease(
+	storage: IBrainStorage,
+	leaseResolution: LeaseResolution
+): Promise<void> {
+	const lease = leaseResolution.lease;
+	if (!lease || leaseResolution.source !== "header") return;
+
+	await storage.recordAgentLease({
+		lease_id: lease.lease_id,
+		agent_id: lease.agent_id,
+		platform: lease.platform,
+		session_id: lease.session_id,
+		run_id: lease.run_id,
+		parent_lease_id: lease.parent_lease_id,
+		delegation_chain: lease.delegation_chain,
+		capabilities: lease.capabilities,
+		scope: lease.scope as unknown as Record<string, unknown>,
+		status: isLeaseExpired(lease) ? "expired" : "active",
+		issued_at: lease.issued_at,
+		expires_at: lease.expires_at,
+		process_id: lease.process_id,
+		metadata: lease.metadata ?? {}
+	});
+}
+
+function queueLeaseAuditDecision(
+	storage: IBrainStorage,
+	waitUntil: ((promise: Promise<unknown>) => void) | undefined,
+	leaseResolution: LeaseResolution,
+	auth: LeaseAuthorization,
+	toolName: string,
+	args: Record<string, unknown>,
+	result: "allowed" | "denied" | "succeeded" | "failed" | "shadow",
+	reason?: string
+): void {
+	const lease = leaseResolution.lease;
+	const shouldAudit = shouldAuditLeaseDecision(auth);
+	if (!shouldAudit) return;
+
+	const eventPromise = (async () => {
+		const hash = await payloadHash(args);
+		await storage.createAgentAuditEvent({
+			event_type: auth.allowed ? "lease_authorized" : "lease_denied",
+			actor_agent_id: lease?.agent_id,
+			lease_id: lease?.lease_id,
+			platform: lease?.platform,
+			session_id: lease?.session_id,
+			run_id: lease?.run_id,
+			delegation_chain: lease?.delegation_chain ?? [],
+			operation: auth.requirement.operation,
+			tool_name: toolName,
+			resource: auth.requirement.resource ?? {},
+			result,
+			reason: reason ?? auth.reason,
+			payload_hash: hash,
+			diff: {},
+			metadata: {
+				enforcement_mode: leaseResolution.mode,
+				lease_source: leaseResolution.source,
+				required_capabilities: auth.requirement.anyOf
+			}
+		});
+	})().catch(err => {
+		console.error("lease audit write failed:", err instanceof Error ? err.message : "unknown error");
+	});
+
+	if (waitUntil) waitUntil(eventPromise);
+}
+
+type RequestLeaseGate =
+	| { ok: true; leaseResolution: LeaseResolution }
+	| { ok: false; response: Response };
+
+/**
+ * Request-level lease gate — the ONE definition of the reject predicate shared by
+ * every worker route that accepts a lease header (/runtime/trigger, /admin/backfill,
+ * /mcp POST). A parse/missing failure rejects 401 when enforcement mode is
+ * "required", or when the caller actually presented a (malformed) lease header.
+ * This gate only covers resolution; expiry/tenant-scope/capability checks happen
+ * per tool via authorizeLeaseForTool. Semantics verified against the public v1.8
+ * reference — do not change them here without re-verifying.
+ */
+function gateRequestLease(
+	request: Request,
+	env: Env,
+	tenant: string,
+	corsHeaders: Record<string, string>
+): RequestLeaseGate {
+	const mode = normalizeLeaseMode(env.LEASE_ENFORCEMENT_MODE);
+	const leaseResolution = resolveRequestLease(request.headers, tenant, mode);
+	if (leaseResolution.error && (mode === "required" || leaseResolution.source === "header")) {
+		return {
+			ok: false,
+			response: new Response(JSON.stringify({ error: "Lease denied" }), {
+				status: 401,
+				headers: { "Content-Type": "application/json", ...corsHeaders }
+			})
+		};
+	}
+	return { ok: true, leaseResolution };
+}
+
+type AuthorizeAndExecuteResult =
+	| { status: "ok"; result: any; leaseAuthorization: LeaseAuthorization }
+	| { status: "lease_denied"; leaseAuthorization: LeaseAuthorization }
+	| { status: "ledger_failed"; leaseAuthorization: LeaseAuthorization; error: string };
+
+async function authorizeAndExecuteTool(input: {
+	env: Env;
+	ctx: ExecutionContext;
+	tenant: string;
+	leaseResolution: LeaseResolution;
+	toolName: string;
+	args: Record<string, unknown>;
+}): Promise<AuthorizeAndExecuteResult> {
+	const { env, ctx, tenant, leaseResolution, toolName, args } = input;
+	const storage = createStorage(resolveStorageConfig(env), tenant);
+	const leaseAuthorization = authorizeLeaseForTool(leaseResolution.lease, toolName, args, tenant);
+
+	try {
+		await recordPresentedLease(storage, leaseResolution);
+	} catch (err) {
+		const message = err instanceof Error ? err.message : "unknown error";
+		console.error("critical lease ledger write failed:", message);
+		return { status: "ledger_failed", leaseAuthorization, error: message };
+	}
+
+	if (!leaseAuthorization.allowed && leaseResolution.mode === "required") {
+		queueLeaseAuditDecision(
+			storage,
+			ctx.waitUntil.bind(ctx),
+			leaseResolution,
+			leaseAuthorization,
+			toolName,
+			args,
+			"denied",
+			leaseAuthorization.reason
+		);
+		return { status: "lease_denied", leaseAuthorization };
+	}
+
+	queueLeaseAuditDecision(
+		storage,
+		ctx.waitUntil.bind(ctx),
+		leaseResolution,
+		leaseAuthorization,
+		toolName,
+		args,
+		leaseAuthorization.allowed ? "allowed" : "shadow",
+		leaseAuthorization.reason
+	);
+
+	const result = await executeTool(toolName, args, {
+		storage,
+		ai: createWorkersAIBindingAdapter(env.AI),
+		waitUntil: ctx.waitUntil.bind(ctx),
+		crossTenantGrants: grantedTenantsFor(env, tenant),
+		allowedTenants: resolveAllowedTenants(env),
+		tenantAliases: resolveTenantAliases(env),
+		embedQueryPrefix: parseEmbedQueryPrefixEnv(env.EMBED_QUERY_PREFIX),
+		lease: leaseResolution.lease,
+		leaseMode: leaseResolution.mode,
+		leaseResolution,
+		leaseAuthorization
+	});
+
+	return { status: "ok", result, leaseAuthorization };
+}
+
 // ============ MCP PROTOCOL ============
 
-async function handleMcpRequest(request: JsonRpcRequest, env: Env, ctx: ExecutionContext, tenant: string): Promise<JsonRpcResponse> {
+async function handleMcpRequest(
+	request: JsonRpcRequest,
+	env: Env,
+	ctx: ExecutionContext,
+	tenant: string,
+	leaseResolution: LeaseResolution
+): Promise<JsonRpcResponse> {
 	const { id, method, params } = request;
 
 	try {
@@ -179,17 +394,44 @@ async function handleMcpRequest(request: JsonRpcRequest, env: Env, ctx: Executio
 
 			case "tools/call": {
 				const { name, arguments: args } = params;
-				const storage = createStorage(resolveStorageConfig(env), tenant);
-				const result = await executeTool(name, args || {}, {
-					storage,
-					ai: env.AI,
-					waitUntil: ctx.waitUntil.bind(ctx),
-					crossTenantGrants: grantedTenantsFor(env, tenant)
+				const toolArgs = args || {};
+				const execution = await authorizeAndExecuteTool({
+					env,
+					ctx,
+					tenant,
+					leaseResolution,
+					toolName: name,
+					args: toolArgs
 				});
+
+				if (execution.status === "lease_denied") {
+					return {
+						jsonrpc: "2.0",
+						id,
+						error: {
+							code: -32001,
+							message: "Lease denied",
+							data: {
+								operation: execution.leaseAuthorization.requirement.operation,
+								reason: execution.leaseAuthorization.reason
+							}
+						}
+					};
+				}
+				if (execution.status === "ledger_failed") {
+					return {
+						jsonrpc: "2.0",
+						id,
+						error: {
+							code: -32002,
+							message: "Lease ledger unavailable"
+						}
+					};
+				}
 				return {
 					jsonrpc: "2.0",
 					id,
-					result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] }
+					result: { content: [{ type: "text", text: JSON.stringify(execution.result, null, 2) }] }
 				};
 			}
 
@@ -220,7 +462,7 @@ export default {
 		if (origin && allowedOrigins.includes(origin)) {
 			corsHeaders["Access-Control-Allow-Origin"] = origin;
 			corsHeaders["Access-Control-Allow-Methods"] = "POST, OPTIONS";
-			corsHeaders["Access-Control-Allow-Headers"] = "Content-Type, Authorization";
+			corsHeaders["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Brain-Tenant, X-Brain-Lease";
 		}
 
 		if (request.method === "OPTIONS") {
@@ -337,6 +579,9 @@ export default {
 				});
 			}
 			const tenant = tenantResolution.tenant;
+			const leaseGate = gateRequestLease(request, env, tenant, corsHeaders);
+			if (!leaseGate.ok) return leaseGate.response;
+			const leaseResolution = leaseGate.leaseResolution;
 
 			let payload: Record<string, unknown> = {};
 			if (rawBody.byteLength > 0) {
@@ -357,15 +602,33 @@ export default {
 				}
 			}
 
-			const storage = createStorage(resolveStorageConfig(env), tenant);
-			const result = await executeTool("mind_runtime", { action: "trigger", ...payload }, {
-				storage,
-				ai: env.AI,
-				waitUntil: ctx.waitUntil.bind(ctx),
-				crossTenantGrants: grantedTenantsFor(env, tenant)
+			const runtimeArgs = { action: "trigger", ...payload };
+			const execution = await authorizeAndExecuteTool({
+				env,
+				ctx,
+				tenant,
+				leaseResolution,
+				toolName: "mind_runtime",
+				args: runtimeArgs
 			});
-			const status = result?.error ? 400 : 200;
-			return new Response(JSON.stringify(result), {
+			if (execution.status === "lease_denied") {
+				return new Response(JSON.stringify({
+					error: "Lease denied",
+					operation: execution.leaseAuthorization.requirement.operation,
+					reason: execution.leaseAuthorization.reason
+				}), {
+					status: 401,
+					headers: { "Content-Type": "application/json", ...corsHeaders }
+				});
+			}
+			if (execution.status === "ledger_failed") {
+				return new Response(JSON.stringify({ error: "Lease ledger unavailable" }), {
+					status: 503,
+					headers: { "Content-Type": "application/json", ...corsHeaders }
+				});
+			}
+			const status = execution.result?.error ? 400 : 200;
+			return new Response(JSON.stringify(execution.result), {
 				status,
 				headers: { "Content-Type": "application/json", ...corsHeaders }
 			});
@@ -384,6 +647,13 @@ export default {
 				});
 			}
 			const tenant = tenantResolution.tenant;
+
+			// Request-level gate (parse/missing) — full expiry/scope/capability
+			// authorization happens below, after body validation, once we know
+			// which operation (read vs write) the caller is asking for.
+			const leaseGate = gateRequestLease(request, env, tenant, corsHeaders);
+			if (!leaseGate.ok) return leaseGate.response;
+			const leaseResolution = leaseGate.leaseResolution;
 
 			let parsedBody: unknown = {};
 			if (rawBody.byteLength > 0) {
@@ -406,6 +676,22 @@ export default {
 			}
 			const { mode, limit, chunkSize } = validated.body;
 
+			// Full lease authorization (expiry / tenant scope / capability) — this admin
+			// route bypasses the tool layer, so it mirrors authorizeAndExecuteTool by hand:
+			// authorize against the equivalent tool operation, persist any presented lease
+			// to the ledger (fail closed, same as the reference), audit the decision
+			// fire-and-forget via waitUntil, and reject in required mode. mode "coverage"
+			// is a read (mind_health/status); mode "backfill" is a write
+			// (mind_maintain/backfill) and therefore auditable.
+			const backfillToolName = mode === "coverage" ? "mind_health" : "mind_maintain";
+			const backfillToolArgs = { action: mode === "coverage" ? "status" : "backfill" };
+			const backfillAuthorization = authorizeLeaseForTool(
+				leaseResolution.lease,
+				backfillToolName,
+				backfillToolArgs,
+				tenant
+			);
+
 			// Check the AI binding before constructing storage — no point opening a
 			// connection for a request that's about to bail with 503.
 			if (mode === "backfill" && !env.AI) {
@@ -417,6 +703,47 @@ export default {
 
 			const storage = createStorage(resolveStorageConfig(env), tenant);
 
+			try {
+				await recordPresentedLease(storage, leaseResolution);
+			} catch (err) {
+				const message = err instanceof Error ? err.message : "unknown error";
+				console.error("critical lease ledger write failed:", message);
+				return new Response(JSON.stringify({ error: "Lease ledger unavailable" }), {
+					status: 503,
+					headers: { "Content-Type": "application/json", ...corsHeaders }
+				});
+			}
+
+			if (!backfillAuthorization.allowed && leaseResolution.mode === "required") {
+				queueLeaseAuditDecision(
+					storage,
+					ctx.waitUntil.bind(ctx),
+					leaseResolution,
+					backfillAuthorization,
+					backfillToolName,
+					backfillToolArgs,
+					"denied",
+					backfillAuthorization.reason
+				);
+				return new Response(JSON.stringify({
+					error: "Lease denied",
+					reason: backfillAuthorization.reason
+				}), {
+					status: 403,
+					headers: { "Content-Type": "application/json", ...corsHeaders }
+				});
+			}
+			queueLeaseAuditDecision(
+				storage,
+				ctx.waitUntil.bind(ctx),
+				leaseResolution,
+				backfillAuthorization,
+				backfillToolName,
+				backfillToolArgs,
+				backfillAuthorization.allowed ? "allowed" : "shadow",
+				backfillAuthorization.reason
+			);
+
 			if (mode === "coverage") {
 				const coverage = await storage.getEmbeddingCoverage();
 				return new Response(JSON.stringify({ tenant, ...coverage }), {
@@ -424,7 +751,7 @@ export default {
 				});
 			}
 
-			const provider = createEmbeddingProvider(env.AI as Ai);
+			const provider = createEmbeddingProvider(createWorkersAIBindingAdapter(env.AI)!);
 			const backfilledIds: string[] = [];
 			const allSkipped: Array<{ id: string; reason: string }> = [];
 			// A row that fails to embed stays embedding=NULL and would otherwise be
@@ -530,6 +857,9 @@ export default {
 				});
 			}
 			const tenant = tenantResolution.tenant;
+			const leaseGate = gateRequestLease(request, env, tenant, corsHeaders);
+			if (!leaseGate.ok) return leaseGate.response;
+			const leaseResolution = leaseGate.leaseResolution;
 
 			let body: JsonRpcRequest | JsonRpcRequest[];
 			try {
@@ -548,11 +878,11 @@ export default {
 						headers: { "Content-Type": "application/json", ...corsHeaders }
 					});
 				}
-				const responses = await Promise.all(body.map(req => handleMcpRequest(req, env, ctx, tenant)));
+				const responses = await Promise.all(body.map(req => handleMcpRequest(req, env, ctx, tenant, leaseResolution)));
 				return new Response(JSON.stringify(responses), { headers: { "Content-Type": "application/json", ...corsHeaders } });
 			}
 
-			const response = await handleMcpRequest(body, env, ctx, tenant);
+			const response = await handleMcpRequest(body, env, ctx, tenant, leaseResolution);
 			return new Response(JSON.stringify(response), { headers: { "Content-Type": "application/json", ...corsHeaders } });
 		}
 
@@ -566,243 +896,15 @@ export default {
 		return new Response("Not Found", { status: 404, headers: corsHeaders });
 	},
 
-	// Daemon cron
-	async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
-		console.log("Daemon cycle starting...", getTimestamp());
-
-		let totalDecayChanges = 0;
-		let totalNoveltyChanges = 0;
-
-		for (const tenant of resolveAllowedTenants(env)) {
-			const storage = createStorage(resolveStorageConfig(env), tenant);
-			let decayChanges = 0;
-
-			// Sprint 4: Daemon Intelligence tasks run FIRST (before decay pass).
-			// Proposals need to see pre-decay charge phases — the decay pass promotes
-			// active → processing, narrowing the proposal candidate pool.
-			try {
-				const daemonResults = await runDaemonTasks(storage);
-				for (const r of daemonResults) {
-					const errSuffix = r.error ? ` (error: ${r.error})` : "";
-					console.log(`Daemon [${tenant}] ${r.task}: ${r.changes} changes, ${r.proposals_created} proposals${errSuffix}`);
-				}
-			} catch (e) {
-				console.error(`Daemon [${tenant}] Sprint 4 error:`, e);
-			}
-
-			// Parallel read of all territories
-			const territoryData = await storage.readAllTerritories();
-
-			// Decay pass: identify changed observations, update individually (no destructive territory rewrite).
-			const decayTexturesToUpdate: { id: string; texture: Observation["texture"] }[] = [];
-
-			for (const { observations: obs } of territoryData) {
-				for (const o of obs) {
-					if (o.texture?.salience === "foundational") continue;
-
-					const lastAccessed = o.last_accessed || o.created;
-					if (!lastAccessed) continue;
-
-					const age = (Date.now() - new Date(lastAccessed).getTime()) / (1000 * 60 * 60 * 24);
-					const originalTexture = JSON.stringify(o.texture);
-
-					if (age > 7 && o.texture?.vividness === "crystalline") {
-						o.texture.vividness = "vivid";
-					} else if (age > 30 && o.texture?.vividness === "vivid") {
-						o.texture.vividness = "soft";
-					}
-
-					if (age > 14 && o.texture?.grip === "iron") {
-						o.texture.grip = "strong";
-					} else if (age > 60 && o.texture?.grip === "strong") {
-						o.texture.grip = "present";
-					}
-
-					// Charge phase advancement: fresh → active after 1h, active → processing after 24h
-					const FRESH_TO_ACTIVE_DAYS = 1 / 24; // 1 hour
-					if (o.texture?.charge_phase === "fresh" && age > FRESH_TO_ACTIVE_DAYS) {
-						o.texture.charge_phase = "active";
-					} else if (o.texture?.charge_phase === "active" && age > 1) {
-						o.texture.charge_phase = "processing";
-					}
-
-					if (JSON.stringify(o.texture) !== originalTexture) {
-						decayTexturesToUpdate.push({ id: o.id, texture: o.texture });
-					}
-				}
-			}
-
-			// Batch UPDATE via unnest — single subrequest instead of N individual UPDATEs.
-			await storage.bulkReplaceTexture(decayTexturesToUpdate);
-			decayChanges = decayTexturesToUpdate.length;
-
-			// Subconscious processing (v2 tool dispatch)
-			try {
-				await executeTool("mind_subconscious", { action: "process" }, { storage, ai: env.AI });
-				console.log(`Daemon [${tenant}]: subconscious processed`);
-			} catch (e) {
-				console.error(`Daemon [${tenant}]: subconscious error`, e);
-			}
-
-			// AI proposal review — Workers AI (cheap 3B model) reviews what auto-absorption
-			// left pending (link/orphan_rescue/dedup). Needs env.AI, so it's a standalone
-			// call rather than a runDaemonTasks() task (the orchestrator has no AI binding).
-			try {
-				const aiReviewChanges = await runAiProposalReview(storage, env.AI);
-				console.log(`Daemon [${tenant}] ai-review: ${aiReviewChanges} proposals reviewed`);
-			} catch (e) {
-				console.error(`Daemon [${tenant}]: ai-review error`, e);
-			}
-
-			// Novelty regeneration — boost novelty_score for observations unsurfaced >30 days
-			try {
-				const noveltyTexturesToUpdate: { id: string; texture: Observation["texture"] }[] = [];
-
-				for (const { observations } of territoryData) {
-					for (const o of observations) {
-						if (o.texture?.salience === "foundational") continue;
-
-						if (!o.texture?.novelty_score) {
-							if (!o.texture) continue;
-							o.texture.novelty_score = 0.5;
-							noveltyTexturesToUpdate.push({ id: o.id, texture: o.texture });
-						} else if (o.texture.last_surfaced_at) {
-							const daysSinceSurfaced = (Date.now() - new Date(o.texture.last_surfaced_at).getTime()) / (1000 * 60 * 60 * 24);
-							if (daysSinceSurfaced >= 30 && o.texture.novelty_score < 0.8) {
-								const boost = Math.min(0.1 * Math.floor(daysSinceSurfaced / 30), 0.5);
-								o.texture.novelty_score = Math.min(o.texture.novelty_score + boost, 1.0);
-								noveltyTexturesToUpdate.push({ id: o.id, texture: o.texture });
-							}
-						}
-					}
-				}
-
-				await storage.bulkReplaceTexture(noveltyTexturesToUpdate);
-				totalNoveltyChanges += noveltyTexturesToUpdate.length;
-				console.log(`Daemon [${tenant}]: ${noveltyTexturesToUpdate.length} novelty regenerations`);
-			} catch (e) {
-				console.error(`Daemon [${tenant}]: novelty error`, e);
-			}
-
-			// One-time backfill: generate summaries for existing observations.
-			try {
-				const backfillDone = await storage.readBackfillFlag("v4");
-				if (!backfillDone) {
-					const backfillUpdates: { territory: string; obs: Observation }[] = [];
-
-					for (const { territory, observations } of territoryData) {
-						for (const obs of observations) {
-							if (!obs.summary) {
-								obs.summary = generateSummary(obs);
-								backfillUpdates.push({ territory, obs });
-							}
-						}
-					}
-
-					await Promise.all(backfillUpdates.map(({ territory, obs }) =>
-						storage.appendToTerritory(territory, obs)
-					));
-
-					await storage.writeBackfillFlag("v4", { completed: getTimestamp(), count: backfillUpdates.length });
-					console.log(`Daemon [${tenant}]: backfilled ${backfillUpdates.length} summaries`);
-				}
-			} catch (e) {
-				console.error(`Daemon [${tenant}]: backfill error`, e);
-			}
-
-			// Generate territory overviews + iron-grip index (every cron cycle)
-			try {
-				const now = Date.now();
-				const cutoff48h = now - (48 * 60 * 60 * 1000);
-				const overviews: TerritoryOverview[] = [];
-				const ironIndex: IronGripEntry[] = [];
-
-				for (const { territory, observations } of territoryData) {
-					const charges: Record<string, number> = {};
-					let ironCount = 0;
-					const ironIds: string[] = [];
-					let recentCount = 0;
-					let maxTime = "";
-
-					for (const o of observations) {
-						for (const c of o.texture?.charge || []) charges[c] = (charges[c] || 0) + 1;
-						if (o.texture?.grip === "iron") {
-							ironCount++;
-							ironIds.push(o.id);
-							ironIndex.push({
-								id: o.id,
-								territory,
-								summary: o.summary || generateSummary(o),
-								charges: o.texture?.charge || [],
-								pull: calculatePullStrength(o),
-								updated: getTimestamp()
-							});
-						}
-						try {
-							if (new Date(o.created).getTime() > cutoff48h) recentCount++;
-						} catch {}
-						if (o.created && o.created > maxTime) maxTime = o.created;
-					}
-
-					const topCharges = Object.entries(charges).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k]) => k);
-					const topGrip = ironCount > 0 ? "iron"
-						: observations.some(o => o.texture?.grip === "strong") ? "strong" : "present";
-
-					overviews.push({
-						territory,
-						observation_count: observations.length,
-						top_charges: topCharges,
-						top_grip: topGrip,
-						recent_count: recentCount,
-						iron_count: ironCount,
-						iron_ids: ironIds,
-						last_activity: maxTime || getTimestamp(),
-						theme_summary: `${territory}: ${observations.length} obs, ${ironCount} iron, ${recentCount} recent`,
-						generated_at: getTimestamp()
-					});
-				}
-
-				await Promise.all([
-					storage.writeOverviews(overviews),
-					storage.writeIronGripIndex(ironIndex)
-				]);
-
-				console.log(`Daemon [${tenant}]: overviews generated (${overviews.length} territories, ${ironIndex.length} iron grip)`);
-			} catch (e) {
-				console.error(`Daemon [${tenant}]: overview generation error`, e);
-			}
-
-			// Embedding backfill — process up to 20 unembedded observations per cycle.
-			// A bad row (see embedBackfillBatch) is skipped, never allowed to throw the whole
-			// cycle's batch away — that all-or-nothing throw was the ~7%-coverage wedge.
-			if (env.AI) {
-				try {
-					const provider = createEmbeddingProvider(env.AI);
-
-					const rows = await storage.queryUnembedded(20);
-
-					if (rows.length > 0) {
-						const { embedded, skipped } = await embedBackfillBatch(provider, rows);
-
-						if (embedded.length > 0) {
-							await storage.bulkUpdateEmbeddings(embedded);
-						}
-						if (skipped.length > 0) {
-							console.warn(`Daemon [${tenant}]: embedding backfill skipped ${skipped.length} rows`, skipped.map(s => s.id));
-						}
-
-						const remainingCount = await storage.countUnembedded();
-						console.log(`Daemon [${tenant}]: backfilled ${embedded.length} embeddings (${remainingCount} remaining)`);
-					}
-				} catch (e) {
-					console.error(`Daemon [${tenant}]: embedding backfill error`, e);
-				}
-			}
-
-			console.log(`Daemon [${tenant}]: ${decayChanges} decay changes`);
-			totalDecayChanges += decayChanges;
-		}
-
-		console.log(`Daemon complete. Decay: ${totalDecayChanges}, Novelty: ${totalNoveltyChanges}`);
+	// Intentionally a no-op (2026-09-04): nightly metabolism (decay/novelty) runs on
+	// the box via rook-brain-daemon.timer, not on the Worker — see wrangler.jsonc.
+	// This handler is kept (not deleted) so that if a cron trigger is ever
+	// re-added to wrangler.jsonc by mistake, the Worker logs instead of running
+	// the cycle a second time (and instead of crashing on the Free-plan CPU cap).
+	async scheduled(_event: ScheduledController, _env: Env, _ctx: ExecutionContext): Promise<void> {
+		console.log(JSON.stringify({
+			event: "scheduled_noop",
+			note: "nightly metabolism runs on the box runner; see wrangler.jsonc"
+		}));
 	}
 } satisfies ExportedHandler<Env>;

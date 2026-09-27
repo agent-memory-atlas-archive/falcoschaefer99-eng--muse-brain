@@ -18,7 +18,14 @@ import { createBidirectionalLink } from "../helpers";
 
 const LINK_CONFIDENCE_THRESHOLD = 0.92;
 const ORPHAN_RESCUE_CONFIDENCE_THRESHOLD = 0.90;
-const MAX_ABSORB_PER_RUN = 50;
+// ops/ADR-JANITOR.md §2/§9 commit 4: flat bump, same in both modes — must stay >=
+// RESCUE_LIMIT's backlog-mode value (200, orphans.ts) or absorption becomes the new
+// bottleneck once orphan rescue starts producing that many candidates per night.
+// Exported so test/orphan-flow-invariant.spec.ts can assert
+// RESCUE_LIMIT_BACKLOG <= MAX_ABSORB_PER_RUN directly against both real constants —
+// a test-level cross-module check (ops/ADR-JANITOR.md §2.1), never a cross-task
+// import at runtime between orphans.ts and absorption.ts.
+export const MAX_ABSORB_PER_RUN = 200;
 
 export async function runAbsorptionTask(storage: IBrainStorage): Promise<DaemonTaskResult> {
 	let changes = 0;

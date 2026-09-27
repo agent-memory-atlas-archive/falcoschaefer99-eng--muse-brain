@@ -5,10 +5,12 @@
 
 import type { IBrainStorage } from "../../storage/interface";
 import type { DaemonTaskResult } from "../types";
+import type { DaemonRunContext } from "../types";
 
-export async function runCascadeTask(storage: IBrainStorage): Promise<DaemonTaskResult> {
+export async function runCascadeTask(storage: IBrainStorage, context: DaemonRunContext = {}): Promise<DaemonTaskResult> {
 	// Query recent observations
 	const recentResults = await storage.queryObservations({
+		touched_after: context.arrivalBoundary,
 		limit: 30,
 		order_by: "created",
 		order_dir: "desc"

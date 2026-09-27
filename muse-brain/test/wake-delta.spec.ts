@@ -132,6 +132,11 @@ describe('wake delta', () => {
 				updated_at: '2026-03-27T00:00:00.000Z'
 			})),
 			getLimbicConfig: vi.fn(async () => null),
+			readAnchors: vi.fn(async () => []),
+			touchAnchors: vi.fn(async () => undefined),
+			readFoundationalObservations: vi.fn(async () => []),
+			getEmbeddingCoverage: vi.fn(async () => ({ total: 0, embedded: 0 })),
+			readDaemonConfig: vi.fn(async () => ({ tenant_id: 'rainer', link_proposal_threshold: 0, data: {} })),
 			appendWakeLog
 		};
 
@@ -172,6 +177,11 @@ describe('wake delta', () => {
 			listTaskChangesSince: vi.fn(async () => []),
 			listProjectDossiers: vi.fn(async () => []),
 			getLimbicConfig: vi.fn(async () => null),
+			readAnchors: vi.fn(async () => []),
+			touchAnchors: vi.fn(async () => undefined),
+			readFoundationalObservations: vi.fn(async () => []),
+			getEmbeddingCoverage: vi.fn(async () => ({ total: 0, embedded: 0 })),
+			readDaemonConfig: vi.fn(async () => ({ tenant_id: 'rainer', link_proposal_threshold: 0, data: {} })),
 			appendWakeLog
 		};
 
@@ -212,6 +222,11 @@ describe('wake delta', () => {
 			listTaskChangesSince: vi.fn(async () => []),
 			listProjectDossiers: vi.fn(async () => []),
 			getLimbicConfig: vi.fn(async () => null),
+			readAnchors: vi.fn(async () => []),
+			touchAnchors: vi.fn(async () => undefined),
+			readFoundationalObservations: vi.fn(async () => []),
+			getEmbeddingCoverage: vi.fn(async () => ({ total: 0, embedded: 0 })),
+			readDaemonConfig: vi.fn(async () => ({ tenant_id: 'rainer', link_proposal_threshold: 0, data: {} })),
 			appendWakeLog
 		};
 

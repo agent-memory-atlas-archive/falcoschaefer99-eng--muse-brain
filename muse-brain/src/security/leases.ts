@@ -269,7 +269,7 @@ export function isLeaseExpired(lease: BrainLease, nowMs = Date.now()): boolean {
 	return Date.parse(lease.expires_at) <= nowMs;
 }
 
-function hasCapability(lease: BrainLease, required: LeaseCapability): boolean {
+export function hasCapability(lease: BrainLease, required: LeaseCapability): boolean {
 	if (lease.capabilities.includes("*") || lease.capabilities.includes(LEASE_CAPABILITIES.systemRoot)) return true;
 	if (lease.capabilities.includes(required)) return true;
 	const [family] = required.split(".");

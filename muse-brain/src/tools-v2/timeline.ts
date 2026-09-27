@@ -67,8 +67,8 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 
 				if (context.ai) {
 					try {
-						const provider = createEmbeddingProvider(context.ai);
-						const queryEmbedding = await provider.embedText(query);
+						const provider = createEmbeddingProvider(context.ai, { embedQueryPrefix: context.embedQueryPrefix });
+						const queryEmbedding = await provider.embedQuery(query);
 
 						// Delegate to hybridSearch scoped to the same filters for semantic re-ranking.
 						// This gives us proper vector similarity against the full index rather than

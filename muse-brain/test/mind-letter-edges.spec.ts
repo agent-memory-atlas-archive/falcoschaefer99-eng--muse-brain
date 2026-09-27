@@ -367,6 +367,45 @@ describe("mind_letter cross-brain delivery", () => {
 		expect(boxes.companion[0].read).toBe(true);
 	});
 
+	it("delivers to the real 'rook' tenant when the allowlist contains it — allowlist beats the default alias", async () => {
+		// Production scenario: worker sets ALLOWED_TENANTS="rook,rainer" (DB stores
+		// tenant_id='rook'), TENANT_ALIASES unset. The threaded context carries that
+		// allowlist but no alias override, so the compiled-in rook → companion default
+		// would apply — and must NOT: letters to 'rook' have to reach the 'rook' rows.
+		const boxes: Record<string, any[]> = {
+			rainer: [],
+			rook: [],
+			companion: []
+		};
+
+		const makeStorage = (tenant: string): any => ({
+			getTenant: () => tenant,
+			forTenant: vi.fn((nextTenant: string) => makeStorage(nextTenant)),
+			readLetters: vi.fn(async () => boxes[tenant]),
+			writeLetters: vi.fn(async (letters: any[]) => {
+				boxes[tenant] = letters;
+			}),
+			appendLetter: vi.fn(async (letter: any) => {
+				boxes[tenant].push(letter);
+			})
+		});
+
+		const result = await handleCommsTool("mind_letter", {
+			action: "write",
+			to: "rook",
+			to_context: "chat",
+			content: "straight to the rook rows"
+		}, {
+			storage: makeStorage("rainer") as any,
+			allowedTenants: ["rook", "rainer"]
+		});
+
+		expect(result.sent).toBe(true);
+		expect(result.to_tenant).toBe("rook");
+		expect(boxes.rook).toHaveLength(1);
+		expect(boxes.companion).toHaveLength(0);
+	});
+
 	it("rejects unknown recipients, self-send aliases, null bytes, and resolves case-insensitive aliases", async () => {
 		const recipientStorage = {
 			countLettersFromSince: vi.fn(async () => 0),

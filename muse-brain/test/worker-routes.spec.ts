@@ -284,6 +284,26 @@ describe('worker HTTP routes', () => {
 		expect(payload.error).toBe('Invalid tenant');
 	});
 
+	it('/mcp accepts tenant headers case-insensitively — "Rook" resolves like "rook"', async () => {
+		const response = await worker.fetch(
+			makeRequest('/mcp', {
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					Authorization: 'Bearer test-api-key',
+					'X-Brain-Tenant': 'Rook'
+				},
+				body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} })
+			}),
+			env,
+			makeContext()
+		);
+
+		expect(response.status).toBe(200);
+		const payload = await response.json() as { result?: { tools?: unknown[] } };
+		expect(Array.isArray(payload.result?.tools)).toBe(true);
+	});
+
 	it('/mcp rejects malformed JSON payloads', async () => {
 		const response = await worker.fetch(
 			makeRequest('/mcp', {

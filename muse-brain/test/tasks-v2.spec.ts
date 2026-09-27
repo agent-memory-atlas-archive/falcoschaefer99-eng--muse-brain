@@ -407,8 +407,8 @@ describe('tasks v2 tool', () => {
 					repo_slug: 'dupin-service',
 					canonical_repo_url: 'git@github.com:funkatorium/dupin-service.git',
 					default_branch: 'main',
-					local_paths: ['/Users/falco/AI/rainer-workspace/dupin-service'],
-					artifact_roots: ['/Users/falco/AI/rainer-workspace/dupin-service/dist'],
+					local_paths: ['/home/user/AI/rainer-workspace/dupin-service'],
+					artifact_roots: ['/home/user/AI/rainer-workspace/dupin-service/dist'],
 					deploy: {
 						commands: ['npm run deploy']
 					},
@@ -446,7 +446,7 @@ describe('tasks v2 tool', () => {
 			action: 'complete',
 			id: 'task_project_receipt',
 			completion_note: 'Bundle shipped.',
-			artifact_path: '/Users/falco/AI/rainer-workspace/dupin-service/dist/index.js'
+			artifact_path: '/home/user/AI/rainer-workspace/dupin-service/dist/index.js'
 		}, { storage: storage as any });
 
 		expect(result.completed).toBe(true);
@@ -454,10 +454,10 @@ describe('tasks v2 tool', () => {
 			type: 'artifact_receipt',
 			entity_id: project.id,
 			tags: expect.arrayContaining(['receipt', 'artifact-receipt', 'dupin-service']),
-			context: expect.stringContaining('artifact_path=/Users/falco/AI/rainer-workspace/dupin-service/dist/index.js'),
+			context: expect.stringContaining('artifact_path=/home/user/AI/rainer-workspace/dupin-service/dist/index.js'),
 			content: expect.stringContaining('repo_slug: dupin-service')
 		}));
-		expect(result.artifact_receipt.content).toContain('artifact_path: /Users/falco/AI/rainer-workspace/dupin-service/dist/index.js');
+		expect(result.artifact_receipt.content).toContain('artifact_path: /home/user/AI/rainer-workspace/dupin-service/dist/index.js');
 		expect(result.artifact_receipt.content).toContain('deploy_command: npm run deploy');
 		expect(result.artifact_receipt.content).toContain('test_command: npm test');
 		expect(appendToTerritory).toHaveBeenCalledWith('craft', expect.objectContaining({

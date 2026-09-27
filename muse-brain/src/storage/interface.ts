@@ -47,11 +47,18 @@ import type {
 	CapturedSkillRegistryHealth,
 	AgentLeaseRecord,
 	AgentAuditEvent,
-	AgentAuditEventFilter
+	AgentAuditEventFilter,
+	ChargeValenceRow
 } from "../types";
 import type { QuerySignals, RetrievalProfile } from "../retrieval/query-signals";
 import type { RetrievalRerankMode } from "../retrieval/rerank";
-import type { HybridScoreBreakdown } from "../retrieval/scoring";
+import type { AnyHybridScoreBreakdown } from "../retrieval/scoring";
+import type { ArrivalBoundary, StateWindow } from "../daemon/types";
+
+/** Whichever scorer produced this result — the new RRF scorer, or the frozen
+ * legacy scorer (retrieval_profile: "legacy"). Defined in ../retrieval/scoring.ts
+ * next to its constituents; re-exported here for existing importers. */
+export type { AnyHybridScoreBreakdown };
 
 // ============ FILTER / QUERY TYPES ============
 
@@ -85,6 +92,8 @@ export interface ObservationFilter {
 	created_after?: string;
 	/** ISO 8601 — observations created on or before this timestamp. */
 	created_before?: string;
+	/** ISO 8601 — observations created or last accessed on/after this timestamp. */
+	touched_after?: string;
 	/** Observation subtype: "journal", "whisper", etc. */
 	type?: string;
 	/** User-assigned tag filter — any match. */
@@ -121,7 +130,8 @@ export interface HybridSearchOptions {
 	query: string;
 	/** Pre-computed query embedding — if omitted, vector search is skipped. */
 	embedding?: number[];
-	/** Retrieval profile baseline: native (default), balanced, benchmark. */
+	/** Retrieval profile baseline: fused (default), flat, legacy (native/balanced/benchmark
+	 * are frozen aliases of fused — see normalizeRetrievalProfile). */
 	retrieval_profile?: RetrievalProfile;
 	/** Optional pre-extracted query signals (storage extracts when omitted). */
 	query_signals?: QuerySignals;
@@ -132,7 +142,9 @@ export interface HybridSearchOptions {
 	territory?: string;
 	grip?: string[];
 	charge_phase?: string;
-	/** Minimum composite score threshold. Defaults to 0.3. */
+	/** Minimum fused rank-score threshold (0–1 band). Defaults to the resolved profile's
+	 * min_score (fused/flat: 0.02; legacy: 0.3 — ADR-RETRIEVAL-FUSION-RETUNE §1 "Band migration").
+	 * Explicit values here always win over the profile default. */
 	min_similarity?: number;
 	/** Max results to return. Defaults to 10. */
 	limit?: number;
@@ -140,6 +152,16 @@ export interface HybridSearchOptions {
 	circadian_phase?: string;
 	/** Filter to observations linked to this entity. */
 	entity_id?: string;
+	/**
+	 * Per-run overrides for the "fused" profile's rrf_k / lane_weights — the seam the
+	 * benchmark CLI's --rrf-k / --lane-weights sweep flags write through (ADR §1 "Rook's
+	 * note"). Ignored when the resolved profile is "flat" or "legacy": the sweep tunes
+	 * fused only. lane_weights, when present, must be a complete four-key object.
+	 */
+	profile_overrides?: {
+		rrf_k?: number;
+		lane_weights?: { vector: number; keyword: number; entity: number; hint: number };
+	};
 }
 
 /** A hybrid search result with composite score and source indicators. */
@@ -154,8 +176,63 @@ export interface HybridSearchResult {
 	vector_similarity?: number;
 	/** Raw ts_rank score before modulation (if keyword search ran). */
 	keyword_rank?: number;
+	/**
+	 * 1-based position of this candidate within each lane's own ordered pool
+	 * (array index + 1), independent of `keyword_rank` above (which is the raw
+	 * ts_rank magnitude, not a position). A lane key is present only when the
+	 * candidate was returned by that lane's query. Diagnostic — not read by
+	 * `scoreHybridCandidate`.
+	 */
+	lane_ranks?: {
+		vector?: number;
+		keyword?: number;
+		entity?: number;
+		hint?: number;
+	};
 	/** Scoring diagnostics for retrieval analysis. */
-	score_breakdown?: HybridScoreBreakdown;
+	score_breakdown?: AnyHybridScoreBreakdown;
+}
+
+/**
+ * Options for `probeLanes` — locates specific ids within the vector and keyword
+ * lanes' own ordered pools, independent of scoring/fusion/entity/hint. Diagnostic
+ * only: never called from the live `mind_search` retrieval path.
+ */
+export interface LaneProbeOptions {
+	query: string;
+	/** Pre-computed query embedding — if omitted, the vector lane returns nothing. */
+	embedding?: number[];
+	/** Evidence ids to locate within each lane. */
+	ids: string[];
+	/**
+	 * How many rows deep to query each lane (e.g. 200). Backends clamp this to
+	 * [1, 5000] — `probeLanes` never runs an unbounded scan. `runBenchmarkHarness`
+	 * may additionally RAISE the effective depth above this value (never lower)
+	 * so it covers every benchmarked profile's own candidate_pool size — see
+	 * BenchmarkRunConfig.lane_probe in benchmarks/types.ts.
+	 */
+	depth: number;
+}
+
+export interface LaneProbeResult {
+	depth: number;
+	lanes: {
+		vector: { returned: number; top1: number; at_depth: number };
+		keyword: { returned: number; top1: number; at_depth: number };
+	};
+	items: Array<{
+		id: string;
+		/**
+		 * 1-based POSITION within the lane's own ordered pool (null when not found
+		 * within depth). Named `*_position`, not `*_rank`, to avoid colliding with
+		 * `HybridSearchResult.keyword_rank`, which is a ts_rank MAGNITUDE, not a
+		 * position — the two must never share a field name.
+		 */
+		vector_position: number | null;
+		vector_similarity: number | null;
+		keyword_position: number | null;
+		keyword_ts_rank: number | null;
+	}>;
 }
 
 export interface LetterPageOptions {
@@ -184,8 +261,12 @@ export interface TextureUpdate {
 /** Config passed to createStorage. */
 export interface StorageConfig {
 	backend: "postgres" | "sqlite";
+	/** Explicit tenant boundary for this deployment; omitted only for legacy defaults. */
+	allowedTenants?: readonly string[];
 	/** Neon DATABASE_URL — required for postgres backend. */
 	databaseUrl?: string;
+	/** Enable prepared statements; direct Postgres may pass true, while Hyperdrive uses false. */
+	prepare?: boolean;
 	/** Local sqlite file path — required for sqlite backend. */
 	sqlitePath?: string;
 	/** R2Bucket — legacy field (unused in v1.3). */
@@ -199,6 +280,9 @@ export interface IBrainStorage {
 
 	/** Return the current tenant identifier. */
 	getTenant(): string;
+
+	/** Return the validated tenant boundary retained by every storage clone. */
+	getAllowedTenants(): readonly string[];
 
 	/** Return a new IBrainStorage scoped to a different tenant (for cross-brain letters). */
 	forTenant(tenant: string): IBrainStorage;
@@ -238,11 +322,56 @@ export interface IBrainStorage {
 	/** Filtered query across observations. All filter fields are optional (AND-combined). */
 	queryObservations(filter: ObservationFilter): Promise<{ observation: Observation; territory: string }[]>;
 
+	/**
+	 * All foundational-salience observations across every territory, regardless of recency.
+	 * Dedicated query (not queryObservations, whose fetch window is created_at-ordered and
+	 * would risk losing an old foundational memory behind a wall of newer ones) — the wake
+	 * foundation lane's whole point is "unreachable by recency" recall.
+	 *
+	 * ops/ADR-JANITOR.md §5.1 — backends bound the result to FOUNDATIONAL_LANE_CAP
+	 * (../constants), ranked by calculatePullStrength DESCENDING, not by recency. This
+	 * used to be `ORDER BY created_at DESC LIMIT 200`: a truncation-by-recency that ran
+	 * BEFORE the wake foundation lane's own pull-strength ranking ever saw the rows, so a
+	 * high-pull-strength old memory could be dropped here without ever being considered.
+	 * Now the truncation uses the same measure the lane ranks by, so what gets dropped
+	 * past the cap is the least-alive, not merely the oldest. Foundational salience is
+	 * assumed rare, but that assumption can be wrong, so truncation past the cap is
+	 * surfaced (not silent) via countFoundationalObservations() — the wake foundation
+	 * lane reports foundational_total vs foundational_considered from the two together.
+	 */
+	readFoundationalObservations(): Promise<{ observation: Observation; territory: string }[]>;
+
+	/**
+	 * Total count of foundational-salience observations across every territory, independent
+	 * of readFoundationalObservations()'s FOUNDATIONAL_LANE_CAP — lets callers detect and
+	 * surface truncation instead of silently reintroducing recency bias into a lane whose
+	 * entire purpose is being recency-independent. Optional: backends/mocks that predate this
+	 * surface just don't report truncation (readFoundationalObservations().length is used
+	 * as a same-as-considered fallback).
+	 */
+	countFoundationalObservations?(): Promise<number>;
+
+	/**
+	 * Count of observations whose texture.grip is 'iron' — used by
+	 * brain_health.janitor.iron (ops/ADR-JANITOR.md §7). Optional, same
+	 * predates-this-surface fallback convention as countFoundationalObservations.
+	 */
+	countIronObservations?(): Promise<number>;
+
+	/**
+	 * Corpus-wide charge_phase distribution — used by brain_health.janitor.charge_phase.
+	 * Optional, same fallback convention as countFoundationalObservations.
+	 */
+	getChargePhaseCounts?(): Promise<{ fresh: number; active: number; processing: number; metabolized: number }>;
+
 	/** Batch-update texture dimensions for multiple observations (decay daemon). */
 	bulkUpdateTexture(updates: TextureUpdate[]): Promise<void>;
 
 	/** Batch full-replace texture for multiple observations in a single query (unnest). */
 	bulkReplaceTexture(updates: { id: string; texture: Observation["texture"] }[]): Promise<void>;
+
+	/** Apply one daemon decay step in storage and return the number of rows changed. */
+	runDecay(asOf?: Date): Promise<number>;
 
 	/** Overwrite the full texture for a single observation by ID (safe, no destructive territory rewrite). */
 	updateObservationTexture(id: string, texture: Observation["texture"]): Promise<void>;
@@ -282,6 +411,14 @@ export interface IBrainStorage {
 	 * novelty, circadian territory bias).
 	 */
 	hybridSearch(options: HybridSearchOptions): Promise<HybridSearchResult[]>;
+
+	/**
+	 * Read-only diagnostic: locates specific evidence ids within the vector and
+	 * keyword lanes' own ordered pools (at a caller-chosen depth), independent of
+	 * scoring/fusion/entity/hint. Powers the benchmark harness's lane_probe wiring —
+	 * never called from mind_search's live retrieval path.
+	 */
+	probeLanes(options: LaneProbeOptions): Promise<LaneProbeResult>;
 
 	/**
 	 * Record memory cascade pairs for observations that appeared together in a
@@ -327,6 +464,9 @@ export interface IBrainStorage {
 
 	readAnchors(): Promise<Anchor[]>;
 	writeAnchors(anchors: Anchor[]): Promise<void>;
+
+	/** Bump activation_count (+1) and stamp last_activated for the given anchor ids in one write — not N. */
+	touchAnchors(ids: string[]): Promise<void>;
 
 	// --- Desires ---
 
@@ -418,7 +558,9 @@ export interface IBrainStorage {
 	linkObservationToEntity(observationId: string, entityId: string): Promise<void>;
 	getEntityObservations(entityId: string, limit?: number): Promise<{ observation: Observation; territory: string }[]>;
 	/** Batch-fetch observations for multiple entity IDs in a single query. */
-	batchGetEntityObservations(entityIds: string[], limitPerEntity?: number): Promise<Map<string, { observation: Observation; territory: string }[]>>;
+	batchGetEntityObservations(entityIds: string[], limitPerEntity?: number, touchedAfter?: string): Promise<Map<string, { observation: Observation; territory: string }[]>>;
+	/** Count an entity's full bounded corpus without loading observations into JS. */
+	countEntityObservations(entityIds: string[]): Promise<Map<string, { total: number; metabolized: number }>>;
 
 	/**
 	 * Backfill helper: return all observations that have entity_tags set but no entity_id yet.
@@ -429,21 +571,62 @@ export interface IBrainStorage {
 	// --- Daemon Proposals ---
 
 	createProposal(proposal: Omit<DaemonProposal, 'id' | 'proposed_at'>): Promise<DaemonProposal>;
-	listProposals(type?: string, status?: string, limit?: number): Promise<DaemonProposal[]>;
+	/**
+	 * `order` defaults to "newest" (`proposed_at DESC`) — every pre-existing caller
+	 * (mind_propose's review list, kit-hygiene's recent-consolidations read,
+	 * absorption's pending sweep) keeps that behavior unchanged. Pass "oldest" to
+	 * push `proposed_at ASC` into the SQL LIMIT itself — needed wherever the queue
+	 * is deep enough that LIMIT truncates before a caller-side sort could reach the
+	 * old end (ops/ADR-JANITOR.md §0.5: the AI reviewer's FIFO fix, ai-review.ts).
+	 */
+	listProposals(type?: string, status?: string, limit?: number, order?: 'newest' | 'oldest'): Promise<DaemonProposal[]>;
 	getProposalById(id: string): Promise<DaemonProposal | null>;
 	reviewProposal(id: string, status: 'accepted' | 'rejected', feedbackNote?: string): Promise<DaemonProposal>;
 	getProposalStats(): Promise<Record<string, { total: number; accepted: number; rejected: number; ratio: number }>>;
 	proposalExists(type: string, sourceId: string, targetId: string): Promise<boolean>;
 	/** Batch-check whether proposals exist for multiple (type, source, target) triples. Returns a Set of keys that exist. */
 	batchProposalExists(checks: Array<{ type: string; sourceId: string; targetId: string }>): Promise<Set<string>>;
-	/** Auto-reject proposals that have been pending for more than the given number of days. Returns the count expired. */
+	/**
+	 * DELETE (not reject) pending proposals of an expirable type older than `days`,
+	 * plus a one-time backfill of proposals a previous, buggier version of this
+	 * method mis-tombstoned as 'rejected'. See EXPIRABLE_PROPOSAL_TYPES
+	 * (types.ts) and ops/ADR-JANITOR.md §1: a pending proposal nobody reviewed is
+	 * not a rejection, and the old UPDATE...status='rejected' silently blocked its
+	 * own regeneration forever via the status-blind unique index. Returns the total
+	 * row count deleted across both operations.
+	 */
 	expireStaleProposals(days: number): Promise<number>;
 
 	// --- Orphan Management ---
 
+	/**
+	 * Single-id form. No caller in this codebase uses it — the daemon marks in
+	 * batches. Retained as part of the published storage contract (this interface is
+	 * what a self-hoster implements), NOT because a one-off caller exists.
+	 */
 	markOrphan(observationId: string): Promise<void>;
+	/**
+	 * Batch equivalent of markOrphan — one write for the whole set instead of one per id.
+	 * Same semantics as markOrphan (already-marked observations are left untouched).
+	 * Returns the number of rows actually inserted. This is the form the daemon uses.
+	 */
+	markOrphans(observationIds: string[]): Promise<number>;
+	/**
+	 * Least-recently-attempted first in every backend (last_rescue_attempt ASC
+	 * NULLS FIRST, first_marked ASC as tiebreak) — the sort decides which orphans
+	 * get worked. See ops/ADR-JANITOR.md §1: first_marked ASC alone worked the same
+	 * 50 oldest orphans every night, so once those carried tombstoned proposals the
+	 * drain moved zero orphans forever. This ordering makes head-of-line blocking
+	 * impossible by construction.
+	 */
 	listOrphans(status?: string, limit?: number): Promise<OrphanObservation[]>;
+	/** Single-id form. Retained for the storage contract only — see markOrphan. */
 	incrementRescueAttempt(observationId: string): Promise<void>;
+	/**
+	 * Batch equivalent of incrementRescueAttempt — one write for the whole set.
+	 * Returns the number of orphan rows actually updated. This is the form the daemon uses.
+	 */
+	incrementRescueAttempts(observationIds: string[]): Promise<number>;
 	updateOrphanStatus(observationId: string, status: 'rescued' | 'archived'): Promise<void>;
 
 	// --- Daemon Config ---
@@ -458,6 +641,33 @@ export interface IBrainStorage {
 	getEmbeddingCoverage(): Promise<{ total: number; embedded: number }>;
 	getOrphanStats(): Promise<{ orphaned: number; rescued: number; archived: number; oldest_days: number }>;
 	getTopCascadePairs(limit?: number): Promise<Array<{ obs_id_a: string; obs_id_b: string; count: number }>>;
+	/**
+	 * Age (in days, rounded) of the oldest pending proposal across every type, or
+	 * null when none are pending — used by brain_health.janitor.proposals
+	 * (ops/ADR-JANITOR.md §7). Optional, same fallback convention as
+	 * countFoundationalObservations.
+	 */
+	getOldestPendingProposalDays?(): Promise<number | null>;
+
+	// --- Valence Lexicon (ops/ADR-VALENCE-FLOOR.md, slice 0) ---
+
+	/**
+	 * All charge_valence rows for this tenant — read once per nightly run by
+	 * both daemon/tasks/valence-lexicon.ts (to find charges without a row yet)
+	 * and daemon/tasks/valence-floor.ts (to classify eligibility). Optional,
+	 * same predates-this-surface fallback convention as
+	 * countFoundationalObservations — a backend/mock lacking this method makes
+	 * both tasks no-op rather than throw.
+	 */
+	readChargeValence?(): Promise<ChargeValenceRow[]>;
+
+	/**
+	 * Insert-or-update by (tenant_id, charge) — a charge string is the primary
+	 * key, so re-writing an already-classified charge (e.g. nightly
+	 * observation_count recount) overwrites in place rather than duplicating.
+	 * Optional, same fallback convention as readChargeValence above.
+	 */
+	upsertChargeValence?(rows: ChargeValenceRow[]): Promise<void>;
 
 	// --- Daemon: find similar unlinked (for proposal generation) ---
 
@@ -468,11 +678,76 @@ export interface IBrainStorage {
 	findSimilarUnlinked(sourceId: string, limit: number): Promise<Array<{ observation: Observation; territory: string; similarity: number }>>;
 
 	/**
+	 * ops/ADR-JANITOR.md §6.2 — findSimilarUnlinked minus its two exclusion CTEs
+	 * (already_linked, pending_proposals), plus a similarity floor pushed into
+	 * SQL. Deliberately does NOT exclude already-linked targets: a duplicate pair
+	 * the orphan-rescue linker already linked is exactly what dedup needs to see
+	 * (§0.4 item 3 — the opposite requirement from link discovery). Raw cosine,
+	 * not a fused hybridSearch score. This method's own SQL predicates
+	 * (tenant_id, id != sourceId, embedding IS NOT NULL) are structural, not
+	 * protective. Protection-list filtering (foundational, territory='self',
+	 * anchor target, metabolized — §6.4) is entirely the caller's job
+	 * (daemon/tasks/dedup.ts's isProtected()) — the OPPOSITE division of labor
+	 * from findSalienceRegradeCandidates, which embeds its full protection list
+	 * as SQL predicates. Not arbitrary: dedup's protection applies to BOTH sides
+	 * of a candidate pair, and the caller — not this method — decides which
+	 * observation is scanned as the source, so the caller must check the
+	 * source's protection status regardless of what this method returns about
+	 * candidates. Splitting candidate-protection into SQL here and
+	 * source-protection into the caller would fragment one rule across two
+	 * layers; keeping both checks together in the caller keeps the rule
+	 * symmetric. Optional, same predates-this-surface fallback convention as
+	 * countFoundationalObservations.
+	 */
+	findSimilarByEmbedding?(sourceId: string, limit: number, minSimilarity: number): Promise<Array<{ observation: Observation; territory: string; similarity: number }>>;
+
+	/**
 	 * Return observations that are orphan candidates: no entity_id, access_count <= 1,
 	 * created before the cutoff, and not already in orphan_observations.
 	 * All filtering is done in SQL — no links loaded into JS memory.
+	 *
+	 * `cutoffDate` is a StateWindow (age threshold, computed from the clock —
+	 * "created before now minus N days"), branded so a caller cannot pass an
+	 * ArrivalBoundary here by accident. `arrival`, if given, is an ADDITIONAL
+	 * restriction ("and also touched since the last successful run") layered on
+	 * top of the age check — ops/ADR-JANITOR.md §2.1 "instance sixteen": pairing
+	 * a state-window predicate with a recent-arrival requirement is close to
+	 * self-defeating for an orphan query specifically (orphans are, by
+	 * definition, the rows nobody has touched), which is why orphans.ts (the
+	 * only current caller) never passes it. Kept as an optional param, not
+	 * removed, for a caller with a genuinely different need; implementations
+	 * MUST throw if both are given and `arrival > cutoffDate` — see each
+	 * backend's implementation for the exact guard.
 	 */
-	findOrphanCandidates(cutoffDate: string, limit: number): Promise<Observation[]>;
+	findOrphanCandidates(cutoffDate: StateWindow, limit: number, arrival?: ArrivalBoundary): Promise<Observation[]>;
+
+	/**
+	 * Candidates for ops/ADR-JANITOR.md §5's salience_regrade proposal: foundational
+	 * salience, territory != 'self', access_count <= 1, created before minAgeCutoff,
+	 * last_surfaced_at null or before surfacedCutoff (a plain observations column
+	 * written by updateSurfacingEffects, NOT inside texture — ops/ADR-JANITOR.md
+	 * §5.2 says "texture->>'last_surfaced_at'", which is imprecise for Postgres:
+	 * updateSurfacingEffects's jsonb_set only ever mirrors novelty_score into
+	 * texture, never last_surfaced_at), charge_phase not
+	 * 'metabolized' (§2.1), and none of: an anchor's triggers_memory_id target, a
+	 * prior salience_regrade proposal in ANY status (§5.5's anti-nag guarantee —
+	 * rejection must be permanent), a source of an accepted consolidation, present
+	 * in a captured skill artifact's metabolized_observation_ids, or linked
+	 * (inbound or outbound). All filtering in SQL, ordered oldest-first — the
+	 * caller re-sorts by calculatePullStrength ascending (§5.2's actual ranking
+	 * key) and applies its own batch limit.
+	 *
+	 * Deliberately NOT readFoundationalObservations() — that method ranks by
+	 * calculatePullStrength DESC and caps at FOUNDATIONAL_LANE_CAP (ops/ADR-JANITOR.md
+	 * §5.1, fixed from an earlier `ORDER BY created_at DESC LIMIT 200` that truncated
+	 * by recency ahead of any ranking), so it keeps the MOST-alive rows and drops the
+	 * rest; this task exists specifically to reach the LEAST-alive foundational rows —
+	 * the same population approached from the opposite end, for the opposite purpose
+	 * (§5.2 sorts these candidates by calculatePullStrength ASCENDING, the mirror of
+	 * the lane's own DESCENDING sort). Optional, same predates-this-surface fallback
+	 * convention as countFoundationalObservations.
+	 */
+	findSalienceRegradeCandidates?(minAgeCutoff: string, surfacedCutoff: string, limit: number): Promise<Observation[]>;
 
 	// --- Observation Versions (Sprint 6) ---
 

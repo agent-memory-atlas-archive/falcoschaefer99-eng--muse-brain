@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import worker from '../src';
 import { createStorage } from '../src/storage/factory';
+import { LEASE_CAPABILITIES, LEASE_HEADER, type BrainLease } from '../src/security/leases';
 import type { Observation } from '../src/types';
 
 function patchTimingSafeEqual(): void {
@@ -252,6 +253,99 @@ describe('POST /admin/backfill', () => {
 		} finally {
 			rmSync(isolatedTempDir, { recursive: true, force: true });
 		}
+	});
+
+	// Lease-shaped envelope for the companion tenant. allow_all scope so only the
+	// capability list (and expiry) decides the outcome — mode "backfill" requires a
+	// memory.write-class capability (observe.write).
+	function makeLease(overrides: Partial<BrainLease> = {}): BrainLease {
+		return {
+			lease_id: 'lease_backfill_test',
+			agent_id: 'companion',
+			platform: 'claude_code',
+			delegation_chain: ['falco', 'companion'],
+			capabilities: [LEASE_CAPABILITIES.observeWrite] as BrainLease['capabilities'],
+			scope: { tenant: 'companion', allow_all: true },
+			issued_at: '2026-05-11T12:00:00.000Z',
+			expires_at: '2099-01-01T00:00:00.000Z',
+			...overrides
+		};
+	}
+
+	describe('lease enforcement (Michael F1 regression)', () => {
+		function postWithLease(lease: BrainLease, leaseMode?: string): Promise<Response> {
+			const leaseEnv = leaseMode ? { ...env, LEASE_ENFORCEMENT_MODE: leaseMode } : env;
+			return worker.fetch(
+				makeRequest('/admin/backfill', {
+					method: 'POST',
+					headers: {
+						'Content-Type': 'application/json',
+						Authorization: 'Bearer companion-secret-key',
+						[LEASE_HEADER]: JSON.stringify(lease)
+					},
+					body: JSON.stringify({ mode: 'backfill', limit: 10, chunkSize: 2 })
+				}),
+				leaseEnv,
+				makeContext()
+			);
+		}
+
+		it('required mode rejects an expired lease with 403 — even one scoped to another tenant', async () => {
+			// Michael's original probe: expired AND wrong-tenant lease previously got 200 + real writes.
+			const response = await postWithLease(
+				makeLease({ scope: { tenant: 'rainer', allow_all: true }, expires_at: '2020-01-01T00:00:00.000Z' }),
+				'required'
+			);
+			expect(response.status).toBe(403);
+			const payload = await response.json() as { error?: string; reason?: string };
+			expect(payload.error).toBe('Lease denied');
+			expect(payload.reason).toBe('lease expired');
+		});
+
+		it('required mode rejects an under-capability lease with 403 before any writes', async () => {
+			const response = await postWithLease(
+				makeLease({ capabilities: [LEASE_CAPABILITIES.memoryRead] as BrainLease['capabilities'] }),
+				'required'
+			);
+			expect(response.status).toBe(403);
+			const payload = await response.json() as { error?: string; reason?: string };
+			expect(payload.error).toBe('Lease denied');
+			expect(payload.reason).toBe('lease capability denied');
+
+			// No writes happened: all three fixture rows are still unembedded.
+			const coverage = await postBackfill({ mode: 'coverage' });
+			const coveragePayload = await coverage.json() as { total: number; embedded: number };
+			expect(coveragePayload.total).toBe(3);
+			expect(coveragePayload.embedded).toBe(0);
+		});
+
+		it('required mode allows a valid capable lease with 200', async () => {
+			const response = await postWithLease(makeLease(), 'required');
+			expect(response.status).toBe(200);
+			const payload = await response.json() as { embedded: number; remaining: number };
+			expect(payload.embedded).toBe(3);
+			expect(payload.remaining).toBe(0);
+		});
+
+		it('shadow mode lets an under-capability lease through with 200', async () => {
+			const response = await postWithLease(
+				makeLease({ capabilities: [LEASE_CAPABILITIES.memoryRead] as BrainLease['capabilities'] })
+			);
+			expect(response.status).toBe(200);
+			const payload = await response.json() as { embedded: number };
+			expect(payload.embedded).toBe(3);
+		});
+
+		it('records a presented lease to the ledger before executing (Michael F2)', async () => {
+			const lease = makeLease({ lease_id: 'lease_backfill_ledger_proof' });
+			const response = await postWithLease(lease, 'required');
+			expect(response.status).toBe(200);
+
+			const storage = createStorage({ backend: 'sqlite', sqlitePath: env.SQLITE_PATH }, 'companion');
+			const recorded = await storage.getAgentLease(lease.lease_id);
+			expect(recorded?.lease_id).toBe(lease.lease_id);
+			expect(recorded?.status).toBe('active');
+		});
 	});
 
 	it('is scoped to the resolved tenant — a different tenant sees its own empty queue', async () => {

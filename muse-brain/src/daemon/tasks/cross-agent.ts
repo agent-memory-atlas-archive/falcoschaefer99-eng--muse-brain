@@ -6,10 +6,12 @@
 
 import type { IBrainStorage } from "../../storage/interface";
 import type { DaemonTaskResult } from "../types";
+import type { DaemonRunContext } from "../types";
+import { proposalKey } from "../../storage/keys";
 
 const LOOKBACK_DAYS = 7;
 
-export async function runCrossAgentTask(storage: IBrainStorage): Promise<DaemonTaskResult> {
+export async function runCrossAgentTask(storage: IBrainStorage, context: DaemonRunContext = {}): Promise<DaemonTaskResult> {
 	let proposals_created = 0;
 
 	// Get all agent entities
@@ -24,7 +26,9 @@ export async function runCrossAgentTask(storage: IBrainStorage): Promise<DaemonT
 	const agentIdList = agentEntities.map(e => e.id);
 
 	// Batch-fetch all agent observations in a single query (N agents → 1 DB call)
-	const allEntityObs = await storage.batchGetEntityObservations(agentIdList, 100);
+	const allEntityObs = context.arrivalBoundary
+		? await storage.batchGetEntityObservations(agentIdList, 100, context.arrivalBoundary)
+		: await storage.batchGetEntityObservations(agentIdList, 100);
 
 	// Map: entity_id → [ { agent_id, agent_name, obs_id } ]
 	const entityToAgentObs = new Map<string, Array<{ agent_id: string; agent_name: string; obs_id: string }>>();
@@ -36,8 +40,9 @@ export async function runCrossAgentTask(storage: IBrainStorage): Promise<DaemonT
 			// Skip if the observation is about an agent entity itself
 			if (!obs.entity_id || agentIdSet.has(obs.entity_id)) continue;
 
-			// Only consider recent observations
-			if (obs.created < cutoffDate) continue;
+			// Bootstrap retains the historical 7-day lookback. A successful-run
+			// window is more precise and is already enforced by the storage query.
+			if (!context.arrivalBoundary && obs.created < cutoffDate) continue;
 
 			const existing = entityToAgentObs.get(obs.entity_id) ?? [];
 			existing.push({ agent_id: agent.id, agent_name: agent.name, obs_id: obs.id });
@@ -72,7 +77,7 @@ export async function runCrossAgentTask(storage: IBrainStorage): Promise<DaemonT
 		const sourceObsIds = agents.map(([, v]) => v.obs_id);
 
 		// Check if a cross_agent proposal already exists for this entity (batch result)
-		if (existingCrossAgent.has(`cross_agent:${targetEntityId}:${targetEntityId}`)) continue;
+		if (existingCrossAgent.has(proposalKey("cross_agent", targetEntityId, targetEntityId))) continue;
 
 		// Create consolidation candidate
 		await storage.createConsolidationCandidate({

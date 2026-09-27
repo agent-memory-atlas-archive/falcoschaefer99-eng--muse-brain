@@ -93,6 +93,11 @@ function baseStorage(overrides: Record<string, any>) {
 		listTaskChangesSince: vi.fn(async () => []),
 		listProjectDossiers: vi.fn(async () => []),
 		getLimbicConfig: vi.fn(async () => null),
+		readAnchors: vi.fn(async () => []),
+		touchAnchors: vi.fn(async () => undefined),
+		readFoundationalObservations: vi.fn(async () => []),
+		getEmbeddingCoverage: vi.fn(async () => ({ total: 0, embedded: 0 })),
+		readDaemonConfig: vi.fn(async () => ({ tenant_id: 'test', link_proposal_threshold: 0, data: {} })),
 		appendWakeLog: vi.fn(async () => undefined),
 		...overrides
 	};

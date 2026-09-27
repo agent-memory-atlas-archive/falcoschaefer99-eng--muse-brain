@@ -361,15 +361,16 @@ export const TOOL_DEFS = [
 				start_date: { type: "string", description: "[timeline] ISO 8601 start date" },
 				end_date: { type: "string", description: "[timeline] ISO 8601 end date" },
 				include_versions: { type: "boolean", description: "[timeline] include edit history per observation" },
-				retrieval_profile: { type: "string", enum: ["native", "balanced", "benchmark", "flat"] },
-				profile: { type: "string", enum: ["native", "balanced", "benchmark", "flat"] },
+				retrieval_profile: { type: "string", enum: ["fused", "flat", "legacy", "native", "balanced", "benchmark"] },
+				profile: { type: "string", enum: ["fused", "flat", "legacy", "native", "balanced", "benchmark"] },
 				rerank_mode: { type: "string", enum: ["off", "heuristic", "model"] },
 				rerank_top_n: { type: "number" },
 				confidence_threshold: { type: "number" },
 				shadow_mode: { type: "boolean" },
 				recency_boost_days: { type: "number" },
 				recency_boost: { type: "number" },
-				max_context_items: { type: "number" }
+				max_context_items: { type: "number" },
+				side_effects: { type: "boolean", default: true, description: "[search] Set false for automated/diagnostic callers so the search leaves no surfacing footprint — no surface_count / last_accessed / cascade writes" }
 			},
 			required: ["action"]
 		}
@@ -384,12 +385,12 @@ export const TOOL_DEFS = [
 				query: { type: "string", description: "Free-text query — activates hybrid vector + keyword search with Neural Surfacing modulation" },
 				retrieval_profile: {
 					type: "string",
-					enum: ["native", "balanced", "benchmark", "flat"],
-					description: "Hybrid path only: retrieval weighting profile. native=relational baseline, balanced=recall+relation, benchmark=recall-first, flat=keyword-lean baseline."
+					enum: ["fused", "flat", "legacy", "native", "balanced", "benchmark"],
+					description: "Hybrid path only: retrieval weighting profile (fused rank score, 0-1 band). fused=default RRF baseline, flat=keyword-lean baseline, legacy=frozen pre-retune scorer (kill switch). native/balanced/benchmark are frozen aliases of fused."
 				},
 				profile: {
 					type: "string",
-					enum: ["native", "balanced", "benchmark", "flat"],
+					enum: ["fused", "flat", "legacy", "native", "balanced", "benchmark"],
 					description: "Alias for retrieval_profile."
 				},
 				rerank_mode: {
@@ -424,8 +425,9 @@ export const TOOL_DEFS = [
 				confidence_threshold: { type: "number", description: "Optional confidence gate (0.0-1.0) for hybrid query results before prompt injection (query path only)" },
 				shadow_mode: { type: "boolean", default: false, description: "If true, report confidence filtering effects without dropping results (query path only)" },
 				recency_boost_days: { type: "number", description: "Recency boost window in days for confidence scoring (query path only, default 3)" },
-				recency_boost: { type: "number", description: "Confidence boost for recent items (query path only, 0.0-0.5, default 0.15)" },
-				max_context_items: { type: "number", description: "Hard cap for returned context rows after confidence filtering (query path only, default uses limit, max 20)" }
+				recency_boost: { type: "number", description: "Confidence boost for recent items (query path only, 0.0-0.5, default 0.05)" },
+				max_context_items: { type: "number", description: "Hard cap for returned context rows after confidence filtering (query path only, default uses limit, max 20)" },
+				side_effects: { type: "boolean", default: true, description: "Set false for automated/diagnostic callers (the Surfacer, benchmarks) so the search leaves no surfacing footprint — no surface_count / last_accessed / cascade writes (query path only)" }
 				}
 			}
 		},
@@ -1133,10 +1135,10 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 			const explicitRetrievalProfile = normalizeRetrievalProfile(args.retrieval_profile);
 			const explicitAliasProfile = normalizeRetrievalProfile(args.profile);
 			if (args.retrieval_profile !== undefined && explicitRetrievalProfile === undefined) {
-				return { error: "retrieval_profile must be one of: native, balanced, benchmark, flat" };
+				return { error: "retrieval_profile must be one of: fused, flat, legacy (native, balanced, benchmark accepted as aliases for fused)" };
 			}
 			if (args.profile !== undefined && explicitAliasProfile === undefined) {
-				return { error: "profile must be one of: native, balanced, benchmark, flat" };
+				return { error: "profile must be one of: fused, flat, legacy (native, balanced, benchmark accepted as aliases for fused)" };
 			}
 			if (explicitRetrievalProfile && explicitAliasProfile && explicitRetrievalProfile !== explicitAliasProfile) {
 				return { error: "retrieval_profile and profile conflict; use one value" };
@@ -1159,6 +1161,13 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				return { error: "shadow_mode must be a boolean" };
 			}
 			const shadowMode = args.shadow_mode === true;
+			if (args.side_effects !== undefined && typeof args.side_effects !== "boolean") {
+				return { error: "side_effects must be a boolean" };
+			}
+			// ADR-RETRIEVAL-FUSION-RETUNE §4 "Hard prerequisite" — always-surfacing callers
+			// (the Surfacer) close a gain loop into Layer B via surface_count/last_accessed.
+			// Diagnostic/automated callers pass side_effects:false to leave no footprint.
+			const sideEffects = args.side_effects !== false;
 			const parsedRecencyBoostDays = parseOptionalPositiveInt(args.recency_boost_days, 1, 30);
 			if (args.recency_boost_days !== undefined && parsedRecencyBoostDays === undefined) {
 				return { error: "recency_boost_days must be an integer between 1 and 30" };
@@ -1202,8 +1211,8 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 				let embedding: number[] | undefined;
 				if (context.ai) {
 					try {
-						const provider = createEmbeddingProvider(context.ai);
-						embedding = await provider.embedText(query);
+						const provider = createEmbeddingProvider(context.ai, { embedQueryPrefix: context.embedQueryPrefix });
+						embedding = await provider.embedQuery(query);
 					} catch (err) {
 						console.error("mind_query embed failed:", err instanceof Error ? err.message : "unknown error");
 					}
@@ -1263,7 +1272,7 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 					confidenceScored, confidenceThreshold, shadowMode, maxContextItems
 				);
 
-				if (finalResults.length > 0) {
+				if (finalResults.length > 0 && sideEffects) {
 					fireAndForgetSideEffects(context, finalResults.map(r => r.observation.id), "mind_query hybrid");
 				}
 
@@ -1301,9 +1310,14 @@ export async function handleTool(name: string, args: any, context: ToolContext):
 						recency_boost: recencyBoost,
 						below_threshold: belowThresholdCount,
 						pre_cap_count: preCapCount,
-						max_context_items: maxContextItems
+						max_context_items: maxContextItems,
+						side_effects: sideEffects
 					},
 					count: finalResults.length,
+					// score/confidence are fused rank scores (RRF over lane positions,
+					// ADR-RETRIEVAL-FUSION-RETUNE §1) — a 0-1 band, not an absolute
+					// similarity reading. Compare within this response, not against a
+					// remembered number.
 					observations: finalResults.map(r => {
 						const base: any = {
 							id: r.observation.id,

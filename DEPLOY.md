@@ -102,3 +102,6 @@ cd muse-brain && npx wrangler rollback
   (it names "rook-brain" and the live Hyperdrive id).
 - `runner/` is the autonomous runner (separate process, not deployed via this script).
 - Falco's deployed instance is at `rook.funkatorium.org` (set `MUSE_BRAIN_URL` accordingly).
+- Nightly metabolism (decay/novelty) is NOT scheduled by this Worker (no `triggers`
+  block in `wrangler.jsonc`, as of 2026-09-04) — it runs on the box via
+  `rook-brain-daemon.timer`; see `ops/DAEMON-BOX-RUNBOOK.md`.
